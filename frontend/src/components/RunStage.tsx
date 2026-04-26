@@ -1,25 +1,33 @@
-import { useDeferredValue, useEffect, useState } from "react";
+import { useDeferredValue, useEffect, useMemo, useState } from "react";
 
 import { ArtifactDocumentViewer, extractMarkdownOutline, parseMarkdown } from "./ArtifactDocumentViewer";
 import { TraceLogViewer } from "./TraceLogViewer";
+import {
+  avatarLabel,
+  avatarTone,
+  buildChatFinalOutputDocument,
+  buildChatMessages,
+  buildChatProcessItems,
+  buildChatTimeline,
+  buildLedgerFilterItems,
+  buildMachineOutputSummary,
+  buildRunSafetyState,
+  compactText,
+  filterVisibleRuns,
+  formatCollapsedPreview,
+  groupRunsByDay,
+} from "./runStageAdapters";
+import type { ChatMessage, RunLedgerFilter } from "./runStageAdapters";
 import type { Locale, Translator } from "../i18n";
 import type {
-  MemoryEntry,
   WorkflowAgentSession,
-  WorkflowAgentSessionEvent,
   WorkflowArtifactDocument,
-  WorkflowCommandPreview,
+  WorkflowRunContextAudits,
   WorkflowRun,
   WorkflowRunArtifacts,
 } from "../types";
 
 type RunDetailTab = "overview" | "artifacts" | "chat" | "trace";
-type RunLedgerFilter = "all" | "attention" | "running" | "finished";
-type RunGroup = {
-  key: string;
-  label: string;
-  runs: WorkflowRun[];
-};
 
 type RunStageProps = {
   t: Translator;
@@ -34,6 +42,9 @@ type RunStageProps = {
   agentSessions: WorkflowAgentSession[];
   agentSessionsLoading: boolean;
   agentSessionsError: string;
+  runContextAudits: WorkflowRunContextAudits | null;
+  contextAuditsLoading: boolean;
+  contextAuditError: string;
   selectedArtifactKey: WorkflowArtifactDocument["key"];
   onSelectRun: (runId: string) => void;
   onSelectArtifact: (key: WorkflowArtifactDocument["key"]) => void;
@@ -50,57 +61,12 @@ type RunStageProps = {
   agentRoleLabel: (role: string) => string;
   statusLabel: (status: string) => string;
   formatDateTime: (value: string) => string;
-  memorySummary: (items: MemoryEntry[]) => string;
   finalizedStepCount: (run: WorkflowRun) => number;
   readyArtifactCount: (artifacts: WorkflowRunArtifacts | null) => number;
   writtenMemoryCount: (run: WorkflowRun | null) => number;
   recalledMemoryCount: (run: WorkflowRun | null) => number;
   promotedGlobalRuleCount: (run: WorkflowRun | null) => number;
   embedded?: boolean;
-};
-
-type ChatMessage = {
-  id: string;
-  stepId: string;
-  agentRole: string;
-  title: string;
-  body: string;
-  status: string;
-  timestamp: string | null;
-  backend: WorkflowRun["steps"][number]["backend"];
-  provider: string | null;
-  goal: string | null;
-  dependsOn: string[];
-  commandPreviews: WorkflowCommandPreview[];
-  hasStructuredTimeline: boolean;
-  thinkingMessages: string[];
-  finalMessage: string | null;
-  collapsedPreview: string | null;
-  commandEvents: ChatCommandEvent[];
-  events: WorkflowAgentSessionEvent[];
-};
-
-type ChatActionItem = {
-  label: string;
-  value: string;
-  meta?: string;
-};
-
-type ChatCommandEvent = {
-  id: string;
-  label: string;
-  command: string;
-  status: string;
-  output: string;
-  exitCode: number | null;
-  sequence: number;
-};
-
-type ChatTimeline = {
-  hasStructuredEvents: boolean;
-  thinkingMessages: string[];
-  finalMessage: string | null;
-  commands: ChatCommandEvent[];
 };
 
 export function RunStage({
@@ -116,6 +82,9 @@ export function RunStage({
   agentSessions,
   agentSessionsLoading,
   agentSessionsError,
+  runContextAudits,
+  contextAuditsLoading,
+  contextAuditError,
   selectedArtifactKey,
   onSelectRun,
   onSelectArtifact,
@@ -132,7 +101,6 @@ export function RunStage({
   agentRoleLabel,
   statusLabel,
   formatDateTime,
-  memorySummary,
   finalizedStepCount,
   readyArtifactCount,
   writtenMemoryCount,
@@ -151,47 +119,6 @@ export function RunStage({
     setChatExpanded({});
   }, [selectedRunId]);
 
-  function compactText(value: string, maxLength = 96): string {
-    if (value.length <= maxLength) {
-      return value;
-    }
-    return `${value.slice(0, Math.max(0, maxLength - 3)).trimEnd()}...`;
-  }
-
-  function formatCollapsedPreview(value: string, fallback: string): string {
-    const normalized = value
-      .replace(/\[([^\]]+)\]\([^)]+\)/g, "$1")
-      .replace(/^#+\s*/gm, "")
-      .replace(/`/g, "")
-      .replace(/\s+/g, " ")
-      .trim();
-    return compactText(normalized || fallback, 156);
-  }
-
-  function avatarLabel(role: string): string {
-    const labels: Record<string, string> = {
-      planner: "PL",
-      researcher: "RS",
-      coder: "CD",
-      "runner/tester": "VR",
-      reviewer: "RV",
-      summarizer: "RP",
-    };
-    return labels[role] ?? "AG";
-  }
-
-  function avatarTone(role: string): string {
-    const tones: Record<string, string> = {
-      planner: "planner",
-      researcher: "researcher",
-      coder: "coder",
-      "runner/tester": "runner",
-      reviewer: "reviewer",
-      summarizer: "summarizer",
-    };
-    return tones[role] ?? "default";
-  }
-
   const selectedArtifact =
     runArtifacts?.documents.find((document) => document.key === selectedArtifactKey) ?? runArtifacts?.documents[0] ?? null;
   const artifactCount = readyArtifactCount(runArtifacts);
@@ -201,59 +128,27 @@ export function RunStage({
   const recalledCount = recalledMemoryCount(selectedRun);
   const writtenCount = writtenMemoryCount(selectedRun);
   const promotedRuleCount = promotedGlobalRuleCount(selectedRun);
+  const contextAuditCount = runContextAudits?.audits.length ?? 0;
+  const contextAuditBytes = runContextAudits?.total_input_bytes ?? 0;
+  const contextAuditForbidden = runContextAudits?.total_forbidden_source_attempts ?? 0;
+  const contextAuditInputTokens = runContextAudits?.total_input_tokens ?? 0;
+  const contextAuditCachedTokens = runContextAudits?.total_cached_tokens ?? 0;
+  const contextAuditOutputTokens = runContextAudits?.total_output_tokens ?? 0;
   const selectedRunNeedsApproval = runNeedsDangerousApproval(selectedRun);
-  const confirmableStepRuns =
-    selectedRun?.step_runs.filter((stepRun) => stepRun.command_previews.some((preview) => preview.requires_confirmation)) ?? [];
-  const pendingDangerousCommands = confirmableStepRuns.flatMap((stepRun) =>
-    stepRun.command_previews.filter((preview) => preview.requires_confirmation && !preview.confirmed_at),
+  const { confirmableStepRuns, pendingDangerousCommands, approvedDangerousCommands } = useMemo(
+    () => buildRunSafetyState(selectedRun),
+    [selectedRun],
   );
-  const approvedDangerousCommands = confirmableStepRuns.flatMap((stepRun) =>
-    stepRun.command_previews.filter((preview) => preview.requires_confirmation && preview.confirmed_at),
-  );
-  const promotedRuleTitles =
-    selectedRun?.memory_context.written_global
-      .filter((entry) => entry.entry_kind === "global_rule")
-      .map((entry) => entry.title) ?? [];
   const normalizedRunQuery = deferredRunQuery.trim().toLowerCase();
-  const ledgerFilterItems: Array<{ key: RunLedgerFilter; label: string; count: number }> = [
-    { key: "all", label: t("run.filterAll"), count: runs.length },
-    {
-      key: "attention",
-      label: t("run.filterAttention"),
-      count: runs.filter((run) => runNeedsDangerousApproval(run) || run.status === "failed" || run.status === "cancelled").length,
-    },
-    {
-      key: "running",
-      label: t("run.filterRunning"),
-      count: runs.filter((run) => run.status === "running" || run.status === "planned").length,
-    },
-    {
-      key: "finished",
-      label: t("run.filterFinished"),
-      count: runs.filter((run) => ["completed", "failed", "cancelled"].includes(run.status)).length,
-    },
-  ];
-  const visibleRuns = runs.filter((run) => {
-    const matchesFilter =
-      runFilter === "all"
-        ? true
-        : runFilter === "attention"
-        ? runNeedsDangerousApproval(run) || run.status === "failed" || run.status === "cancelled"
-        : runFilter === "running"
-        ? run.status === "running" || run.status === "planned"
-        : ["completed", "failed", "cancelled"].includes(run.status);
-
-    if (!matchesFilter) {
-      return false;
-    }
-
-    if (!normalizedRunQuery) {
-      return true;
-    }
-
-    return [run.team_name, run.task, run.id].some((value) => value.toLowerCase().includes(normalizedRunQuery));
-  });
-  const runGroups = groupRunsByDay(visibleRuns);
+  const ledgerFilterItems = useMemo(
+    () => buildLedgerFilterItems(runs, t, runNeedsDangerousApproval),
+    [runs, t, runNeedsDangerousApproval],
+  );
+  const visibleRuns = useMemo(
+    () => filterVisibleRuns(runs, runFilter, normalizedRunQuery, runNeedsDangerousApproval),
+    [runs, runFilter, normalizedRunQuery, runNeedsDangerousApproval],
+  );
+  const runGroups = useMemo(() => groupRunsByDay(visibleRuns), [visibleRuns]);
   const selectedArtifactIndex = artifactDocuments.findIndex((document) => document.key === selectedArtifact?.key);
   const availableArtifactDocuments = artifactDocuments.filter((document) => document.available);
   const selectedAvailableArtifactIndex = availableArtifactDocuments.findIndex((document) => document.key === selectedArtifact?.key);
@@ -262,64 +157,21 @@ export function RunStage({
     selectedAvailableArtifactIndex >= 0 && selectedAvailableArtifactIndex < availableArtifactDocuments.length - 1
       ? availableArtifactDocuments[selectedAvailableArtifactIndex + 1]
       : null;
-  const selectedArtifactBlocks =
-    selectedArtifact?.content_type === "markdown" && selectedArtifact.content ? parseMarkdown(selectedArtifact.content) : [];
-  const artifactOutline = extractMarkdownOutline(selectedArtifactBlocks);
+  const selectedArtifactBlocks = useMemo(
+    () => (selectedArtifact?.content_type === "markdown" && selectedArtifact.content ? parseMarkdown(selectedArtifact.content) : []),
+    [selectedArtifact?.content, selectedArtifact?.content_type],
+  );
+  const artifactOutline = useMemo(() => extractMarkdownOutline(selectedArtifactBlocks), [selectedArtifactBlocks]);
   const artifactKindLabel = selectedArtifact ? t(`run.artifactKind.${selectedArtifact.content_type}`) : "";
-  const artifactDocumentMap = new Map(artifactDocuments.map((document) => [document.key, document]));
-
-  const stepRunById = new Map(selectedRun?.step_runs.map((stepRun) => [stepRun.step_id, stepRun]) ?? []);
-
-  const chatMessages: ChatMessage[] =
-    agentSessions.length > 0
-      ? agentSessions.map((session) => ({
-          stepId: session.step_id,
-          goal: stepRunById.get(session.step_id)?.goal ?? null,
-          dependsOn: stepRunById.get(session.step_id)?.depends_on ?? [],
-          commandPreviews: stepRunById.get(session.step_id)?.command_previews ?? [],
-          id: session.id,
-          agentRole: session.agent_role,
-          title: session.title,
-          body: session.summary ?? session.error ?? t("run.chatPending"),
-          status: session.status,
-          timestamp: session.completed_at ?? session.started_at,
-          backend: session.backend,
-          provider: session.provider,
-          hasStructuredTimeline: session.has_structured_timeline,
-          thinkingMessages: session.thinking_messages,
-          finalMessage: session.final_message,
-          collapsedPreview: session.collapsed_preview,
-          commandEvents: session.commands.map((command) => ({
-            id: command.id,
-            label: command.label,
-            command: command.command,
-            status: command.status,
-            output: command.output,
-            exitCode: command.exit_code,
-            sequence: command.sequence,
-          })),
-          events: session.events ?? [],
-        }))
-      : selectedRun?.step_runs.map((stepRun) => ({
-          id: stepRun.step_id,
-          stepId: stepRun.step_id,
-          agentRole: stepRun.agent_role,
-          title: stepRun.title,
-          body: stepRun.summary ?? stepRun.goal ?? t("run.chatPending"),
-          status: stepRun.status,
-          timestamp: stepRun.completed_at ?? stepRun.started_at,
-          backend: stepRun.backend,
-          provider: null,
-          goal: stepRun.goal,
-          dependsOn: stepRun.depends_on,
-          commandPreviews: stepRun.command_previews,
-          hasStructuredTimeline: false,
-          thinkingMessages: [],
-          finalMessage: null,
-          collapsedPreview: null,
-          commandEvents: [],
-          events: [],
-        })) ?? [];
+  const selectedArtifactSummary = selectedArtifact ? buildMachineOutputSummary(selectedArtifact, locale) : null;
+  const artifactDocumentMap = useMemo(
+    () => new Map(artifactDocuments.map((document) => [document.key, document])),
+    [artifactDocuments],
+  );
+  const chatMessages = useMemo(
+    () => buildChatMessages(agentSessions, selectedRun, t("run.chatPending")),
+    [agentSessions, selectedRun, t],
+  );
 
   function isChatExpanded(message: ChatMessage): boolean {
     if (Object.prototype.hasOwnProperty.call(chatExpanded, message.id)) {
@@ -455,11 +307,13 @@ export function RunStage({
                                   {run.cancel_requested_at ? t("run.cancelling") : t("run.cancelRun")}
                                 </button>
                               ) : null}
-                              {(run.status === "failed" || run.status === "cancelled") && !pendingDangerousApproval ? (
+                              {(run.status === "failed" || run.status === "cancelled" || run.status === "short_circuited") && !pendingDangerousApproval ? (
                                 <>
-                                  <button type="button" className="secondary-button" onClick={() => onResumeRun(run.id)} disabled={runLoading}>
-                                    {t("run.resume")}
-                                  </button>
+                                  {run.status !== "short_circuited" ? (
+                                    <button type="button" className="secondary-button" onClick={() => onResumeRun(run.id)} disabled={runLoading}>
+                                      {t("run.resume")}
+                                    </button>
+                                  ) : null}
                                   <button type="button" className="secondary-button" onClick={() => onRetryRun(run.id)} disabled={runLoading}>
                                     {t("run.retry")}
                                   </button>
@@ -568,6 +422,13 @@ export function RunStage({
                       </strong>
                       <p>{selectedRunNeedsApproval ? t("run.safetyNote") : (runStatusNote(selectedRun) ?? t("common.ready"))}</p>
                     </article>
+                    {selectedRun.reuse_decision === "continue_with_delta" ? (
+                      <article className="summary-card">
+                        <span className="meta-label">{t("run.deltaScope")}</span>
+                        <strong>{selectedRun.delta_scope?.verification_focus ?? t("common.none")}</strong>
+                        <p>{selectedRun.delta_scope?.scope_summary ?? selectedRun.delta_hint ?? t("common.none")}</p>
+                      </article>
+                    ) : null}
                     <article className="summary-card">
                       <span className="meta-label">{t("run.memoryRecalled")}</span>
                       <strong>{recalledCount}</strong>
@@ -587,6 +448,21 @@ export function RunStage({
                       <span className="meta-label">{t("run.trace")}</span>
                       <strong>{selectedRun.completed_at ? formatDateTime(selectedRun.completed_at) : t("status.running")}</strong>
                       <p>{t("run.traceHint")}</p>
+                    </article>
+                    <article className="summary-card">
+                      <span className="meta-label">{t("run.contextAudit")}</span>
+                      <strong>{contextAuditsLoading ? t("common.loading") : contextAuditCount}</strong>
+                      <p>
+                        {contextAuditError
+                          ? contextAuditError
+                          : t("run.contextAuditHint", {
+                              bytes: contextAuditBytes,
+                              forbidden: contextAuditForbidden,
+                              inputTokens: contextAuditInputTokens,
+                              cachedTokens: contextAuditCachedTokens,
+                              outputTokens: contextAuditOutputTokens,
+                            })}
+                      </p>
                     </article>
                   </div>
 
@@ -616,6 +492,7 @@ export function RunStage({
                                   <strong>{preview.label}</strong>
                                   <code>{preview.argv.join(" ")}</code>
                                   {preview.cwd ? <span>{t("run.commandCwd")}: {preview.cwd}</span> : null}
+                                  {preview.scope_note ? <span>{preview.scope_note}</span> : null}
                                 </article>
                               ))}
                             </div>
@@ -669,6 +546,7 @@ export function RunStage({
                                       </span>
                                       <code>{preview.argv.join(" ")}</code>
                                       {preview.cwd ? <span>{t("run.commandCwd")}: {preview.cwd}</span> : null}
+                                      {preview.scope_note ? <span>{preview.scope_note}</span> : null}
                                       {preview.confirmed_at ? <span>{t("run.commandApprovedAt")}: {formatDateTime(preview.confirmed_at)}</span> : null}
                                       {preview.requires_confirmation && !preview.confirmed_at ? (
                                         <div className="button-row">
@@ -846,6 +724,12 @@ export function RunStage({
                             <code className="artifact-path">{selectedArtifact.path}</code>
                           </div>
                         ) : null}
+                        {selectedArtifactSummary ? (
+                          <article className="machine-output-note">
+                            <span className="meta-label">{localizedArtifactTitle(selectedArtifact.key, selectedArtifact.title, locale)}</span>
+                            <p>{selectedArtifactSummary}</p>
+                          </article>
+                        ) : null}
                         <ArtifactDocumentViewer
                           document={selectedArtifact}
                           emptyLabel={t("run.artifactEmpty")}
@@ -879,6 +763,7 @@ export function RunStage({
                         const processItems = buildChatProcessItems(message, t, backendLabel);
                         const timeline = buildChatTimeline(message);
                         const finalOutputDocument = buildChatFinalOutputDocument(message, artifactDocumentMap, t, timeline.finalMessage);
+                        const finalOutputSummary = buildMachineOutputSummary(finalOutputDocument, locale);
                         const collapsedMessageCount = processItems.length + timeline.thinkingMessages.length + timeline.commands.length + 1;
                         const localizedStep = localizeStepCopy(message.stepId, locale, message.title, message.goal);
                         const collapsedPreview = formatCollapsedPreview(
@@ -963,6 +848,11 @@ export function RunStage({
                                             <span className="meta-label">{t("run.chatFinalOutput")}</span>
                                             <span>{localizedArtifactTitle(finalOutputDocument.key, finalOutputDocument.title, locale)}</span>
                                           </div>
+                                          {finalOutputSummary ? (
+                                            <article className="machine-output-note compact">
+                                              <p>{finalOutputSummary}</p>
+                                            </article>
+                                          ) : null}
                                           <div className="chat-output-viewer">
                                             <ArtifactDocumentViewer document={finalOutputDocument} emptyLabel={t("run.chatPending")} />
                                           </div>
@@ -1035,223 +925,6 @@ export function RunStage({
   }
 
   return <section className="stage-panel">{content}</section>;
-}
-
-function groupRunsByDay(runs: WorkflowRun[]): RunGroup[] {
-  const groups = new Map<string, WorkflowRun[]>();
-  for (const run of runs) {
-    const timestamp = run.started_at ?? run.created_at;
-    const date = new Date(timestamp);
-    const key = Number.isNaN(date.getTime())
-      ? timestamp.slice(0, 10) || "unknown"
-      : `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, "0")}-${String(date.getDate()).padStart(2, "0")}`;
-    const existing = groups.get(key);
-    if (existing) {
-      existing.push(run);
-    } else {
-      groups.set(key, [run]);
-    }
-  }
-
-  return Array.from(groups.entries()).map(([key, groupedRuns]) => ({
-    key,
-    label: formatRunGroupLabel(key),
-    runs: groupedRuns,
-  }));
-}
-
-function formatRunGroupLabel(key: string): string {
-  const date = new Date(`${key}T00:00:00`);
-  if (Number.isNaN(date.getTime())) {
-    return key;
-  }
-  return new Intl.DateTimeFormat(undefined, {
-    month: "short",
-    day: "numeric",
-    weekday: "short",
-  }).format(date);
-}
-
-function buildChatProcessItems(
-  message: ChatMessage,
-  t: Translator,
-  backendLabel: (backend: WorkflowRun["steps"][number]["backend"]) => string,
-): ChatActionItem[] {
-  const items: ChatActionItem[] = [];
-
-  if (message.goal) {
-    items.push({
-      label: t("run.chatGoal"),
-      value: message.goal,
-    });
-  }
-
-  if (message.commandPreviews.length > 0) {
-    for (const preview of message.commandPreviews) {
-      const metaParts = [preview.argv.join(" "), preview.cwd ? `${t("run.commandCwd")}: ${preview.cwd}` : ""].filter(Boolean);
-      items.push({
-        label: t("run.chatAction"),
-        value: preview.label,
-        meta: metaParts.join(" | "),
-      });
-    }
-  } else {
-    items.push({
-      label: t("run.chatAction"),
-      value: t("run.chatActionFallback", { stage: backendLabel(message.backend) }),
-    });
-  }
-
-  if (message.dependsOn.length > 0) {
-    items.push({
-      label: t("run.chatDependsOn"),
-      value: message.dependsOn.join(", "),
-    });
-  }
-
-  if (message.provider) {
-    items.push({
-      label: t("run.chatProvider"),
-      value: message.provider,
-    });
-  }
-
-  return items;
-}
-
-function buildChatTimeline(message: ChatMessage): ChatTimeline {
-  if (message.hasStructuredTimeline) {
-    return {
-      hasStructuredEvents: true,
-      thinkingMessages: message.thinkingMessages,
-      finalMessage: message.finalMessage,
-      commands: message.commandEvents,
-    };
-  }
-
-  if (message.events.length === 0) {
-    return {
-      hasStructuredEvents: false,
-      thinkingMessages: [],
-      finalMessage: message.body || null,
-      commands: [],
-    };
-  }
-
-  const agentMessages: string[] = [];
-  const commandMap = new Map<string, ChatCommandEvent>();
-
-  for (const event of message.events) {
-    if (event.event_type === "agent_message") {
-      const text = typeof event.payload.text === "string" ? event.payload.text.trim() : "";
-      if (text) {
-        agentMessages.push(text);
-      }
-      continue;
-    }
-
-    if (event.event_type === "command_execution") {
-      const commandId = typeof event.payload.command_id === "string" && event.payload.command_id ? event.payload.command_id : event.id;
-      const existing = commandMap.get(commandId);
-      commandMap.set(commandId, {
-        id: commandId,
-        label:
-          typeof event.payload.label === "string" && event.payload.label
-            ? event.payload.label
-            : typeof event.payload.command === "string" && event.payload.command
-            ? event.payload.command
-            : "Shell command",
-        command: typeof event.payload.command === "string" ? event.payload.command : existing?.command ?? "",
-        status: normalizeCommandStatus(event.payload.status),
-        output:
-          typeof event.payload.output === "string" && event.payload.output
-            ? event.payload.output
-            : existing?.output ?? "",
-        exitCode: typeof event.payload.exit_code === "number" ? event.payload.exit_code : existing?.exitCode ?? null,
-        sequence: event.sequence,
-      });
-    }
-  }
-
-  const commands = Array.from(commandMap.values()).sort((left, right) => left.sequence - right.sequence);
-  if (agentMessages.length === 0) {
-    return {
-      hasStructuredEvents: true,
-      thinkingMessages: [],
-      finalMessage: message.body || null,
-      commands,
-    };
-  }
-
-  if (message.status === "running") {
-    return {
-      hasStructuredEvents: true,
-      thinkingMessages: agentMessages,
-      finalMessage: null,
-      commands,
-    };
-  }
-
-  return {
-    hasStructuredEvents: true,
-    thinkingMessages: agentMessages.slice(0, -1),
-    finalMessage: agentMessages[agentMessages.length - 1] ?? message.body ?? null,
-    commands,
-  };
-}
-
-function buildChatFinalOutputDocument(
-  message: ChatMessage,
-  documents: Map<WorkflowArtifactDocument["key"], WorkflowArtifactDocument>,
-  t: Translator,
-  structuredFinalMessage: string | null,
-): WorkflowArtifactDocument {
-  const preferredKeysByRole: Record<string, WorkflowArtifactDocument["key"][]> = {
-    planner: ["planning_brief"],
-    researcher: ["project_snapshot", "memory_context"],
-    coder: ["last_message", "changes"],
-    "runner/tester": ["verification_brief", "parallel_branches"],
-    reviewer: ["changes"],
-    summarizer: ["report", "memory_context"],
-  };
-
-  const preferredKeys = preferredKeysByRole[message.agentRole] ?? [];
-  for (const key of preferredKeys) {
-    const document = documents.get(key);
-    if (document?.available && document.content) {
-      return document;
-    }
-  }
-
-  if (structuredFinalMessage) {
-    return {
-      key: "last_message",
-      title: t("run.chatInlineReply"),
-      path: null,
-      content_type: "text",
-      available: true,
-      content: structuredFinalMessage,
-    };
-  }
-
-  return {
-    key: "last_message",
-    title: t("run.chatInlineReply"),
-    path: null,
-    content_type: "text",
-    available: true,
-    content: message.body,
-  };
-}
-
-function normalizeCommandStatus(value: unknown): string {
-  if (typeof value !== "string" || !value) {
-    return "completed";
-  }
-  if (value === "in_progress") {
-    return "running";
-  }
-  return value;
 }
 
 function localizeStepCopy(stepId: string, locale: Locale, fallbackTitle: string, fallbackGoal: string | null): { title: string; goal: string } {
@@ -1337,4 +1010,8 @@ const ARTIFACT_TITLES: Partial<Record<WorkflowArtifactDocument["key"], { zh: str
   verification_brief: { zh: "验证简报", en: "Verification brief" },
   parallel_branches: { zh: "并行分支", en: "Parallel branches" },
   memory_context: { zh: "运行记忆", en: "Workflow memory" },
+  research_result: { zh: "调研合约", en: "Research contract" },
+  verify_summary: { zh: "验证合约", en: "Verify contract" },
+  review_result: { zh: "审查合约", en: "Review contract" },
+  final_state: { zh: "终态合约", en: "Final-state contract" },
 };

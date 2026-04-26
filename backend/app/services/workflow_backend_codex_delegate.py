@@ -5,9 +5,12 @@ from collections.abc import Callable
 from pathlib import Path
 
 from app.config import Settings
-from app.models.dto import WorkflowRunRecord
+from app.models.dto import WorkflowRunRecord, WorkflowStepRun
 from app.services.workflow_agent_sessions import set_agent_runtime_metadata
 from app.services.codex import get_codex_capabilities
+from app.services.workflow_context_audit import set_active_context_audit
+from app.services.workflow_context_gateway import finalize_step_context, prepare_step_context
+from app.services.workflow_backend_exceptions import WorkflowCancellationRequested
 from app.services.workflow_backend_runtime import run_command
 from app.services.workflow_run_store import append_log, trim_summary
 
@@ -40,6 +43,7 @@ def _run_delegated_command(
 def execute_delegated_codex_backend(
     *,
     record: WorkflowRunRecord,
+    step_run: WorkflowStepRun,
     settings: Settings,
     backend_label: str,
     artifact_path: Path,
@@ -54,26 +58,32 @@ def execute_delegated_codex_backend(
         set_agent_runtime_metadata(provider=f"{backend_label.lower().replace(' ', '_')}_local_fallback")
         return fallback()
 
-    artifact_path.parent.mkdir(parents=True, exist_ok=True)
+    prepared = prepare_step_context(
+        record=record,
+        step_run=step_run,
+        settings=settings,
+        output_filename=artifact_path.name,
+    )
     argv = [
         "codex",
         "exec",
         "-C",
-        record.project_path,
+        str(prepared.workspace_path),
         "-s",
         "read-only",
         "--skip-git-repo-check",
         "--json",
         "-o",
-        str(artifact_path),
+        str(prepared.output_path),
         prompt,
     ]
 
+    set_active_context_audit(prepared.audit_id)
     try:
         completed = _run_delegated_command(
             argv,
             settings=settings,
-            cwd=record.project_path,
+            cwd=str(prepared.workspace_path),
             timeout=DELEGATED_BACKEND_TIMEOUT_SECONDS,
             log_prefix=f"{backend_label}-delegated",
             record=record,
@@ -86,8 +96,10 @@ def execute_delegated_codex_backend(
         append_log(record, f"{backend_label} delegated backend failed and is falling back to local execution: {exc}")
         set_agent_runtime_metadata(provider=f"{backend_label.lower().replace(' ', '_')}_local_fallback")
         return fallback()
+    finally:
+        set_active_context_audit(None)
 
-    if completed.returncode != 0 or not artifact_path.exists():
+    if completed.returncode != 0 or not prepared.output_path.exists():
         append_log(
             record,
             f"{backend_label} delegated backend returned exit code {completed.returncode}; falling back to local execution.",
@@ -95,6 +107,8 @@ def execute_delegated_codex_backend(
         set_agent_runtime_metadata(provider=f"{backend_label.lower().replace(' ', '_')}_local_fallback")
         return fallback()
 
+    artifact_path.parent.mkdir(parents=True, exist_ok=True)
+    finalize_step_context(prepared=prepared, final_output_path=artifact_path, record=record)
     set_agent_runtime_metadata(
         provider=f"{backend_label.lower().replace(' ', '_')}_delegated_codex",
         session_ref=str(artifact_path),

@@ -904,6 +904,25 @@ summary:focus-visible {
   gap: 8px;
 }
 
+.machine-output-note {
+  display: grid;
+  gap: 8px;
+  padding: 12px 14px;
+  border-radius: 16px;
+  border: 1px solid rgba(37, 183, 255, 0.18);
+  background: linear-gradient(180deg, rgba(10, 20, 40, 0.84), rgba(6, 12, 24, 0.82));
+}
+
+.machine-output-note.compact {
+  padding: 10px 12px;
+}
+
+.machine-output-note p {
+  margin: 0;
+  color: var(--muted);
+  line-height: 1.6;
+}
+
 .chat-thinking-shell,
 .chat-command-shell,
 .chat-command-output {
@@ -2235,6 +2254,12 @@ summary:focus-visible {
     grid-template-columns: 1fr;
   }
 
+  .run-filter-row {
+    flex-wrap: nowrap;
+    overflow-x: auto;
+    padding-bottom: 4px;
+  }
+
   .chat-message {
     grid-template-columns: 1fr;
   }
@@ -2257,6 +2282,20 @@ summary:focus-visible {
   .detail-tab,
   .artifact-tab {
     flex: 0 0 auto;
+  }
+
+  .chat-inline-summary,
+  .chat-output-header {
+    align-items: flex-start;
+  }
+
+  .chat-collapsed-row {
+    flex-direction: column;
+    align-items: stretch;
+  }
+
+  .chat-collapsed-meta {
+    justify-content: flex-start;
   }
 
   .artifact-reader-toolbar {

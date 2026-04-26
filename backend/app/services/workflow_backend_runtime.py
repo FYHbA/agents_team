@@ -13,6 +13,8 @@ from app.config import Settings
 from app.models.dto import WorkflowCommandPreview
 from app.models.dto import WorkflowRunRecord
 from app.services.workflow_agent_sessions import append_agent_session_event
+from app.services.workflow_context_audit import record_forbidden_source_attempt, update_context_audit_usage
+from app.services.workflow_context_policy import FORBIDDEN_SOURCE_MARKERS
 from app.services.workflow_backend_exceptions import WorkflowCancellationRequested, WorkflowExecutionError
 from app.services.workflow_run_store import append_log
 
@@ -67,12 +69,49 @@ def _record_plain_command_event(
     )
 
 
-def _capture_codex_stream_event(settings: Settings, line: str) -> None:
+def _looks_forbidden_source(command: str) -> bool:
+    lowered = command.lower()
+    return any(marker.lower() in lowered for marker in FORBIDDEN_SOURCE_MARKERS)
+
+
+def _usage_int(value: object) -> int | None:
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        return int(value)
+    return None
+
+
+def _capture_codex_usage_event(settings: Settings, payload: dict) -> bool:
+    usage = payload.get("usage")
+    if not isinstance(usage, dict):
+        return False
+    input_tokens = _usage_int(usage.get("input_tokens"))
+    cached_tokens = _usage_int(usage.get("cached_input_tokens"))
+    if cached_tokens is None:
+        cached_tokens = _usage_int(usage.get("cached_tokens"))
+    output_tokens = _usage_int(usage.get("output_tokens"))
+    if input_tokens is None and cached_tokens is None and output_tokens is None:
+        return False
+    update_context_audit_usage(
+        settings=settings,
+        input_tokens=input_tokens,
+        cached_tokens=cached_tokens,
+        output_tokens=output_tokens,
+    )
+    return True
+
+
+def _capture_codex_stream_event(settings: Settings, record: WorkflowRunRecord, line: str) -> None:
     try:
         payload = json.loads(line)
     except json.JSONDecodeError:
         return
     if not isinstance(payload, dict):
+        return
+    if _capture_codex_usage_event(settings, payload):
         return
 
     item = payload.get("item")
@@ -93,13 +132,17 @@ def _capture_codex_stream_event(settings: Settings, line: str) -> None:
         return
 
     if item_type == "command_execution" and isinstance(item.get("command"), str):
+        command_text = item["command"]
+        if _looks_forbidden_source(command_text):
+            if record_forbidden_source_attempt(settings, command_text):
+                append_log(record, f"context-audit: forbidden source access attempt detected in command `{command_text}`")
         append_agent_session_event(
             settings=settings,
             event_type="command_execution",
             payload={
                 "command_id": str(item.get("id") or ""),
                 "label": str(item.get("command") or ""),
-                "command": item["command"],
+                "command": command_text,
                 "status": str(item.get("status") or ""),
                 "output": str(item.get("aggregated_output") or ""),
                 "exit_code": item.get("exit_code"),
@@ -197,7 +240,7 @@ def run_command(
             if source == "stdout":
                 stdout_chunks.append(line)
                 if looks_like_codex_stream:
-                    _capture_codex_stream_event(settings, line)
+                    _capture_codex_stream_event(settings, record, line)
             else:
                 stderr_chunks.append(line)
     finally:
@@ -257,6 +300,8 @@ def _load_package_scripts(project_path: Path) -> dict[str, str]:
 
 def verification_commands(project_path: Path, *, focus: str = "all") -> list[tuple[str, list[str]]]:
     commands: list[tuple[str, list[str]]] = []
+    if focus in {"docs", "none"}:
+        return commands
 
     has_python_tests = (project_path / "tests").exists() or (project_path / "pyproject.toml").exists()
     include_tests = focus in {"all", "tests"}

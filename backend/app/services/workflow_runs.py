@@ -13,6 +13,7 @@ from app.models.dto import (
     WorkflowPlanRequest,
     WorkflowStep,
     WorkflowRunArtifactsResponse,
+    WorkflowRunContextAuditsResponse,
     WorkflowRunCreateRequest,
     WorkflowRunDeleteResponse,
     WorkflowRunLogResponse,
@@ -21,6 +22,7 @@ from app.models.dto import (
 from app.services.codex import build_session_bridge
 from app.services.runtime import init_project_runtime, project_runtime_path, resolve_project_path
 from app.services.workflow_agent_sessions import delete_agent_sessions, list_agent_sessions
+from app.services.workflow_context_audits import read_workflow_context_audits
 from app.services.workflow_memory import build_memory_context
 from app.services.workflow_run_queue import delete_workflow_queue_items, get_workflow_queue_dashboard, has_active_workflow_queue_item
 from app.services.workflow_run_artifacts import changes_template, read_run_artifacts, report_template
@@ -203,6 +205,12 @@ def create_workflow_run(request: WorkflowRunCreateRequest, settings: Settings) -
         outputs=plan.outputs,
         warnings=warnings,
         error=None,
+        reuse_decision=None,
+        matched_run_id=None,
+        reuse_reason=None,
+        reuse_confidence=None,
+        delta_hint=None,
+        delta_scope=None,
         step_runs=[],
         memory_context=memory_context,
         memory_guidance=plan.memory_guidance,
@@ -238,6 +246,10 @@ def read_workflow_run_artifacts(run_id: str, project_path_str: str | None, setti
     return read_run_artifacts(record)
 
 
+def read_workflow_run_context_audits(run_id: str, settings: Settings) -> WorkflowRunContextAuditsResponse:
+    return read_workflow_context_audits(run_id, settings)
+
+
 def delete_workflow_run(run_id: str, project_path_str: str | None, settings: Settings) -> WorkflowRunDeleteResponse:
     record = get_workflow_run(run_id, project_path_str, settings)
     if record.status == "running":
@@ -271,6 +283,7 @@ __all__ = [
     "list_workflow_runs",
     "read_workflow_run_log",
     "read_workflow_run_artifacts",
+    "read_workflow_run_context_audits",
     "resume_workflow_run",
     "resume_workflow_run_now",
     "retry_workflow_run",

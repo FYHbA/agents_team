@@ -19,6 +19,7 @@ import {
   getWorkflowQueueDashboard,
   getWorkflowRun,
   getWorkflowRunArtifacts,
+  getWorkflowRunContextAudits,
   getWorkflowRunEventsUrl,
   getWorkflowRunLog,
   getWorkflowRuns,
@@ -40,7 +41,6 @@ import { WorkspaceStage } from "./components/WorkspaceStage";
 import { useI18n } from "./i18n";
 import type {
   CodexSummary,
-  MemoryEntry,
   ProjectCapabilities,
   ProjectRecord,
   ProjectRootEntry,
@@ -50,6 +50,8 @@ import type {
   RecentProjectRecord,
   WorkflowAgentSession,
   WorkflowArtifactDocument,
+  WorkflowContextAudit,
+  WorkflowRunContextAudits,
   WorkflowPlan,
   WorkflowQueueDashboard,
   WorkflowQueueItem,
@@ -123,6 +125,7 @@ export default function App() {
   const [selectedArtifactKey, setSelectedArtifactKey] = useState<WorkflowArtifactDocument["key"]>("report");
   const [queueDashboard, setQueueDashboard] = useState<WorkflowQueueDashboard | null>(null);
   const [agentSessions, setAgentSessions] = useState<WorkflowAgentSession[]>([]);
+  const [runContextAudits, setRunContextAudits] = useState<WorkflowRunContextAudits | null>(null);
   const [mirrorResult, setMirrorResult] = useState<ProjectRuntimeMirrorResult | null>(null);
 
   const [bootstrapError, setBootstrapError] = useState("");
@@ -132,6 +135,7 @@ export default function App() {
   const [artifactError, setArtifactError] = useState("");
   const [queueError, setQueueError] = useState("");
   const [agentSessionsError, setAgentSessionsError] = useState("");
+  const [contextAuditError, setContextAuditError] = useState("");
   const [mirrorError, setMirrorError] = useState("");
 
   const [loading, setLoading] = useState(false);
@@ -140,6 +144,7 @@ export default function App() {
   const [artifactLoading, setArtifactLoading] = useState(false);
   const [queueLoading, setQueueLoading] = useState(false);
   const [agentSessionsLoading, setAgentSessionsLoading] = useState(false);
+  const [contextAuditsLoading, setContextAuditsLoading] = useState(false);
   const [mirrorLoading, setMirrorLoading] = useState(false);
 
   const artifactRefreshToken = useMemo(() => {
@@ -411,6 +416,51 @@ export default function App() {
   }, [selectedRunId, artifactRefreshToken, selectedRun?.status]);
 
   useEffect(() => {
+    let cancelled = false;
+
+    async function loadContextAudits(runId: string, silent = false) {
+      if (!silent) {
+        setContextAuditsLoading(true);
+      }
+      try {
+        const result = await getWorkflowRunContextAudits(runId);
+        if (!cancelled) {
+          setRunContextAudits(result);
+          setContextAuditError("");
+        }
+      } catch (error) {
+        if (!cancelled) {
+          setContextAuditError(error instanceof Error ? error.message : "Failed to load context audits.");
+        }
+      } finally {
+        if (!cancelled && !silent) {
+          setContextAuditsLoading(false);
+        }
+      }
+    }
+
+    if (!selectedRunId) {
+      setRunContextAudits(null);
+      setContextAuditError("");
+      return;
+    }
+
+    void loadContextAudits(selectedRunId);
+    const timer =
+      selectedRun?.status === "running"
+        ? window.setInterval(() => {
+            void loadContextAudits(selectedRunId, true);
+          }, 2000)
+        : null;
+    return () => {
+      cancelled = true;
+      if (timer !== null) {
+        window.clearInterval(timer);
+      }
+    };
+  }, [selectedRunId, artifactRefreshToken, selectedRun?.status]);
+
+  useEffect(() => {
     setSelectedArtifactKey((currentKey) => {
       const currentDocument = runArtifacts?.documents.find((document) => document.key === currentKey);
       if (currentDocument?.available) {
@@ -566,6 +616,12 @@ export default function App() {
     if (run.status === "cancelled" && run.cancelled_at) {
       return `${t("status.cancelled")} ${t("common.at")} ${formatDateTime(run.cancelled_at)}`;
     }
+    if (run.reuse_decision && run.reuse_decision !== "continue") {
+      return run.reuse_reason ?? run.reuse_decision;
+    }
+    if (run.status === "short_circuited") {
+      return run.reuse_reason ?? t("status.short_circuited");
+    }
     if (run.dangerous_commands_confirmed_at) {
       return `${t("run.safetyApproved")} ${t("common.at")} ${formatDateTime(run.dangerous_commands_confirmed_at)}`;
     }
@@ -573,13 +629,6 @@ export default function App() {
       return `${t("run.attempt")} ${run.attempt_count}`;
     }
     return null;
-  }
-
-  function memorySummary(entries: MemoryEntry[]): string {
-    if (entries.length === 0) {
-      return t("common.none");
-    }
-    return entries.map((entry) => entry.title).join(" | ");
   }
 
   function finalizedStepCount(run: WorkflowRun): number {
@@ -938,8 +987,10 @@ export default function App() {
         setRunLog("");
         setRunArtifacts(null);
         setAgentSessions([]);
+        setRunContextAudits(null);
         setArtifactError("");
         setAgentSessionsError("");
+        setContextAuditError("");
         setSelectedArtifactKey("report");
       }
       await loadProjectState(selectedProject, deletingSelectedRun ? undefined : selectedRunId);
@@ -1055,6 +1106,9 @@ export default function App() {
               agentSessions={agentSessions}
               agentSessionsLoading={agentSessionsLoading}
               agentSessionsError={agentSessionsError}
+              runContextAudits={runContextAudits}
+              contextAuditsLoading={contextAuditsLoading}
+              contextAuditError={contextAuditError}
               selectedArtifactKey={selectedArtifactKey}
               onSelectRun={(runId) => {
                 setSelectedRunId(runId);
@@ -1074,7 +1128,6 @@ export default function App() {
               agentRoleLabel={agentRoleLabel}
               statusLabel={statusLabel}
               formatDateTime={formatDateTime}
-              memorySummary={memorySummary}
               finalizedStepCount={finalizedStepCount}
               readyArtifactCount={readyArtifactCount}
               writtenMemoryCount={writtenMemoryCount}
@@ -1089,8 +1142,14 @@ export default function App() {
               queueDashboard={queueDashboard}
               queueLoading={queueLoading}
               queueError={queueError}
+              selectedRun={selectedRun}
+              runContextAudits={runContextAudits}
+              contextAuditsLoading={contextAuditsLoading}
+              contextAuditError={contextAuditError}
               queueItemNote={queueItemNote}
               queueModeLabel={queueModeLabel}
+              backendLabel={backendLabel}
+              formatDateTime={formatDateTime}
             />
           }
         />

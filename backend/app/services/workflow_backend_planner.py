@@ -7,6 +7,7 @@ from app.config import Settings
 from app.models.dto import WorkflowRunRecord
 from app.services.workflow_artifact_paths import planning_brief_path
 from app.services.workflow_backend_codex_delegate import execute_delegated_codex_backend
+from app.services.workflow_run_store import step_lookup
 
 
 def _local_planning_brief(record: WorkflowRunRecord) -> str:
@@ -40,17 +41,14 @@ def _planner_prompt(record: WorkflowRunRecord) -> str:
     return "\n".join(
         [
             "You are the planner backend for an Agents Team workflow.",
-            "Produce a markdown planning brief for the run. Do not edit project files.",
-            "Focus on sequencing, continuity risks, recalled memory, and explicit handoff expectations.",
+            "Produce a markdown planning brief for the run.",
+            "Use the structured files in `.agents-context/` as your only workflow context source.",
+            "Focus on sequencing, continuity risks, recalled memory summaries, and explicit handoff expectations.",
             "",
             f"Run id: {record.id}",
             f"Task: {record.task}",
             "",
-            "Planner memory guidance:",
-            *([f"- {item}" for item in record.memory_guidance.planner] or ["- No planner memory guidance was generated."]),
-            "",
-            "Workflow steps to cover:",
-            *[f"- `{step.id}` via `{step.backend}`: {step.goal}" for step in record.steps],
+            "Read `.agents-context/project-summary.json`, `.agents-context/run-state.json`, `.agents-context/step-context.json`, and `.agents-context/selected-memory.json` first.",
             "",
             "Output sections:",
             "- Objective",
@@ -67,8 +65,10 @@ def execute_planner_backend(
     should_cancel: Callable[[], bool],
     set_active_process: Callable[[subprocess.Popen[str] | None], None],
 ) -> str:
+    step_run = step_lookup(record, "plan")
     return execute_delegated_codex_backend(
         record=record,
+        step_run=step_run,
         settings=settings,
         backend_label="Planner backend",
         artifact_path=planning_brief_path(record),

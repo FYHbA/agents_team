@@ -9,6 +9,7 @@ from app.models.dto import (
     WorkflowAgentSessionRecord,
     WorkflowQueueDashboardResponse,
     WorkflowRunArtifactsResponse,
+    WorkflowRunContextAuditsResponse,
     WorkflowRunDeleteResponse,
     WorkflowPlanRequest,
     WorkflowPlanResponse,
@@ -27,6 +28,7 @@ from app.services.workflow_runs import (
     get_workflow_run,
     list_workflow_runs,
     read_workflow_run_artifacts,
+    read_workflow_run_context_audits,
     read_workflow_run_log,
     resume_workflow_run,
     retry_workflow_run,
@@ -105,6 +107,14 @@ def read_run_artifacts(
     settings: Settings = Depends(get_settings),
 ) -> WorkflowRunArtifactsResponse:
     return read_workflow_run_artifacts(run_id, project_path, settings)
+
+
+@router.get("/runs/{run_id}/context-audits", response_model=WorkflowRunContextAuditsResponse)
+def read_run_context_audits(
+    run_id: str,
+    settings: Settings = Depends(get_settings),
+) -> WorkflowRunContextAuditsResponse:
+    return read_workflow_run_context_audits(run_id, settings)
 
 
 @router.get("/runs/{run_id}/events")

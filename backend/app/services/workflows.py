@@ -3,11 +3,19 @@ from __future__ import annotations
 from pathlib import Path
 
 from app.config import Settings
-from app.models.dto import AgentCard, WorkflowCommandPreview, WorkflowMemoryContext, WorkflowPlanRequest, WorkflowPlanResponse, WorkflowStep
+from app.models.dto import (
+    AgentCard,
+    WorkflowCommandPreview,
+    WorkflowMemoryContext,
+    WorkflowPlanRequest,
+    WorkflowPlanResponse,
+    WorkflowStep,
+)
+from app.services.runtime import get_project_runtime
 from app.services.workflow_backend_registry import backend_for_step
 from app.services.workflow_backend_runtime import verification_command_previews
-from app.services.runtime import get_project_runtime
 from app.services.workflow_memory import build_memory_context, build_role_memory_guidance
+from app.services.workflow_reuse import has_recent_reuse_candidate
 
 
 def _task_lower(task: str) -> str:
@@ -18,7 +26,7 @@ def _use_zh(locale: str | None) -> bool:
     return locale == "zh-CN"
 
 
-def _needs_research(task: str, *, has_memory_context: bool) -> bool:
+def _needs_research(task: str, *, has_memory_context: bool, has_recent_reuse_candidates: bool) -> bool:
     keywords = {
         "investigate",
         "debug",
@@ -36,7 +44,7 @@ def _needs_research(task: str, *, has_memory_context: bool) -> bool:
         "规划",
         "梳理",
     }
-    return has_memory_context or any(keyword in task for keyword in keywords)
+    return has_memory_context or has_recent_reuse_candidates or any(keyword in task for keyword in keywords)
 
 
 def _needs_parallel_checks(task: str) -> bool:
@@ -58,7 +66,13 @@ def _needs_parallel_checks(task: str) -> bool:
     return any(keyword in task for keyword in keywords)
 
 
-def _build_agents(task: str, *, has_memory_context: bool, locale: str | None) -> list[AgentCard]:
+def _build_agents(
+    task: str,
+    *,
+    has_memory_context: bool,
+    has_recent_reuse_candidates: bool,
+    locale: str | None,
+) -> list[AgentCard]:
     use_zh = _use_zh(locale)
     agents = [
         AgentCard(
@@ -69,9 +83,9 @@ def _build_agents(task: str, *, has_memory_context: bool, locale: str | None) ->
                 if use_zh
                 else "Translates the task into a strict workflow and chooses serial or parallel paths."
             ),
-        ),
+        )
     ]
-    if _needs_research(task, has_memory_context=has_memory_context):
+    if _needs_research(task, has_memory_context=has_memory_context, has_recent_reuse_candidates=has_recent_reuse_candidates):
         agents.append(
             AgentCard(
                 name="调研者" if use_zh else "Researcher",
@@ -151,6 +165,7 @@ def _build_steps(
     confirm_dangerous: bool,
     *,
     has_memory_context: bool,
+    has_recent_reuse_candidates: bool,
     project_path_str: str | None,
     locale: str | None,
 ) -> list[WorkflowStep]:
@@ -175,8 +190,9 @@ def _build_steps(
             depends_on=[],
         )
     ]
+
     implementation_dependency = "plan"
-    if _needs_research(task, has_memory_context=has_memory_context):
+    if _needs_research(task, has_memory_context=has_memory_context, has_recent_reuse_candidates=has_recent_reuse_candidates):
         steps.append(
             WorkflowStep(
                 id="research",
@@ -197,6 +213,7 @@ def _build_steps(
             )
         )
         implementation_dependency = "research"
+
     steps.append(
         WorkflowStep(
             id="implement",
@@ -208,6 +225,7 @@ def _build_steps(
             depends_on=[implementation_dependency],
         )
     )
+
     review_dependencies: list[str]
     if parallel_checks:
         verify_steps = [
@@ -281,6 +299,7 @@ def _build_steps(
             )
         )
         review_dependencies = ["verify"]
+
     steps.append(
         WorkflowStep(
             id="review",
@@ -355,16 +374,20 @@ def build_workflow_plan(
     project_name = Path(request.project_path).name if request.project_path else "workspace"
     allow_network = settings.default_allow_network if request.allow_network is None else request.allow_network
     allow_installs = settings.default_allow_installs if request.allow_installs is None else request.allow_installs
+
     resolved_memory_context = _resolve_memory_context(request, settings, memory_context)
     has_memory_context = bool(
         resolved_memory_context
         and (resolved_memory_context.recalled_project or resolved_memory_context.recalled_global)
     )
+    has_recent_reuse_candidates = has_recent_reuse_candidate(request.project_path, request.task, settings)
+
     memory_guidance = (
         build_role_memory_guidance(resolved_memory_context, locale=locale)
         if resolved_memory_context
         else build_role_memory_guidance(WorkflowMemoryContext(project_memory_path="", global_memory_path=None), locale=locale)
     )
+
     team_name = f"{project_name}-任务编组" if use_zh else f"{project_name}-task-force"
     warnings = [
         (
@@ -392,7 +415,7 @@ def build_workflow_plan(
         )
     if not allow_installs:
         warnings.append(
-            "当前草稿已关闭安装依赖，所以需要避免把修复建立在 install 步骤上。"
+            "当前草稿已关闭安装依赖，所以需要避免把修复建立在 install 步骤之上。"
             if use_zh
             else "Package installation is disabled for this draft, so dependency fixes must avoid install steps."
         )
@@ -401,6 +424,12 @@ def build_workflow_plan(
             "这次运行召回了历史记忆，所以审查和交接时要明确说明哪些旧结论被延续、修正或替换。"
             if use_zh
             else "Planner memory recall is active for this run, so reviewer/reporter continuity checks should stay in scope."
+        )
+    if has_recent_reuse_candidates:
+        warnings.append(
+            "这个项目里已经有近期相似的成功运行，所以 research 会先判断是否可以直接复用，或只保留差量执行。"
+            if use_zh
+            else "A recent similar successful run already exists for this project, so research will first decide whether the workflow can be reused or narrowed to a delta-only pass."
         )
 
     summary = (
@@ -422,11 +451,17 @@ def build_workflow_plan(
         allow_network=allow_network,
         allow_installs=allow_installs,
         command_policy="dangerous-commands-confirmed",
-        agents=_build_agents(task, has_memory_context=has_memory_context, locale=locale),
+        agents=_build_agents(
+            task,
+            has_memory_context=has_memory_context,
+            has_recent_reuse_candidates=has_recent_reuse_candidates,
+            locale=locale,
+        ),
         steps=_build_steps(
             task,
             confirm_dangerous=settings.default_confirm_dangerous_commands,
             has_memory_context=has_memory_context,
+            has_recent_reuse_candidates=has_recent_reuse_candidates,
             project_path_str=request.project_path,
             locale=locale,
         ),

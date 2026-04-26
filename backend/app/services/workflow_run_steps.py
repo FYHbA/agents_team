@@ -8,6 +8,8 @@ from app.config import Settings
 from app.models.dto import WorkflowRunRecord, WorkflowStepRun
 from app.services.workflow_backend_exceptions import WorkflowCancellationRequested, WorkflowExecutionError
 from app.services.workflow_agent_sessions import set_agent_runtime_metadata
+from app.services.workflow_context_audit import set_active_context_audit
+from app.services.workflow_context_gateway import finalize_step_context, prepare_step_context
 from app.services.workflow_backend_planner import execute_planner_backend
 from app.services.workflow_backend_research import execute_research_backend
 from app.services.workflow_backend_registry import backend_for_step, step_family
@@ -21,11 +23,13 @@ from app.services.workflow_run_store import append_log, trim_summary
 RUN_TIMEOUT_SECONDS = 60 * 45
 
 
-def build_codex_prompt(record: WorkflowRunRecord) -> str:
+def build_codex_prompt(record: WorkflowRunRecord, step_run: WorkflowStepRun) -> str:
     rules = [
-        "- Work only inside the provided project directory.",
+        "- Work only inside the projected workspace that was prepared for this step.",
+        "- Read context from `.agents-context/` instead of rediscovering historical workflow state.",
         "- Make the requested file changes directly when needed.",
         "- Do not create Git commits or push changes.",
+        "- Do not attempt to read `.agents-team`, raw logs, raw memory files, or historical reports.",
         "- Finish with a concise summary of changed files, verification performed, and remaining risks.",
     ]
     if record.allow_network:
@@ -39,34 +43,36 @@ def build_codex_prompt(record: WorkflowRunRecord) -> str:
     rules.append("- Avoid destructive commands because this run is non-interactive.")
 
     step_lines = [f"- {step.id}: {step.title} ({step.agent_role}) -> {step.goal}" for step in record.steps]
-    project_memory_lines = [
-        f"- {entry.title}: {entry.summary}" for entry in record.memory_context.recalled_project
-    ] or ["- No project memory recalled."]
-    global_memory_lines = [
-        f"- {entry.title}: {entry.summary}" for entry in record.memory_context.recalled_global
-    ] or ["- No global memory recalled."]
     return "\n".join(
         [
             "You are executing an Agents Team workflow run.",
             f"Run id: {record.id}",
             f"Task: {record.task}",
+            f"Current step: {step_run.step_id} ({step_run.agent_role}) -> {step_run.goal}",
             "",
             "Workflow steps:",
             *step_lines,
             "",
+            "Context files to read first:",
+            f"- .agents-context/step-context.json",
+            f"- .agents-context/run-state.json",
+            f"- .agents-context/selected-memory.json",
+            f"- .agents-context/upstream-handoff.json if present",
+            "",
             "Execution rules:",
             *rules,
-            "",
-            "Project memory recall:",
-            *project_memory_lines,
-            "",
-            "Global memory recall:",
-            *global_memory_lines,
         ]
     )
 
 
-def _codex_exec_argv(record: WorkflowRunRecord, settings: Settings) -> tuple[list[str], str, str, str | None]:
+def _codex_exec_argv(
+    record: WorkflowRunRecord,
+    step_run: WorkflowStepRun,
+    settings: Settings,
+    *,
+    workspace_path: Path,
+    output_path: Path,
+) -> tuple[list[str], str, str, str | None]:
     capabilities = get_codex_capabilities(settings)
     if not capabilities.codex_cli_available:
         raise WorkflowExecutionError("Codex CLI is not available on PATH.")
@@ -75,57 +81,70 @@ def _codex_exec_argv(record: WorkflowRunRecord, settings: Settings) -> tuple[lis
         "codex",
         "exec",
         "-C",
-        record.project_path,
+        str(workspace_path),
         "-s",
         "workspace-write" if record.direct_file_editing else "read-only",
         "--skip-git-repo-check",
         "--json",
         "-o",
-        record.last_message_path or str(Path(record.run_path) / "last-message.md"),
+        str(output_path),
     ]
 
-    prompt = build_codex_prompt(record)
-    if record.codex_session_id and capabilities.exec_resume_available:
-        argv.extend(["resume", record.codex_session_id, prompt])
-        return argv, "Resumed the selected Codex session in non-interactive mode.", "codex_exec_resume", record.codex_session_id
-
-    if record.codex_session_id and not capabilities.exec_resume_available:
+    prompt = build_codex_prompt(record, step_run)
+    if record.codex_session_id:
         append_log(
             record,
-            "Requested Codex session resume, but `codex exec resume` is unavailable. Falling back to a fresh non-interactive run.",
+            "Requested Codex session resume, but isolated context execution always starts a fresh non-interactive Codex run.",
         )
 
     argv.append(prompt)
-    return argv, "Started a fresh Codex non-interactive run.", "codex_exec_fresh", None
+    return argv, "Started a fresh Codex non-interactive run inside the isolated context workspace.", "codex_exec_fresh", None
 
 
 def execute_codex_step(
     record: WorkflowRunRecord,
+    step_run: WorkflowStepRun,
     settings: Settings,
     should_cancel: Callable[[], bool],
     set_active_process: Callable[[subprocess.Popen[str] | None], None],
 ) -> str:
-    argv, summary_prefix, provider, session_ref = _codex_exec_argv(record, settings)
-    completed = run_command(
-        argv,
-        settings=settings,
-        cwd=record.project_path,
-        timeout=RUN_TIMEOUT_SECONDS,
-        log_prefix="codex",
+    final_output_path = Path(record.last_message_path or (Path(record.run_path) / "last-message.md"))
+    prepared = prepare_step_context(
         record=record,
-        should_cancel=should_cancel,
-        set_active_process=set_active_process,
+        step_run=step_run,
+        settings=settings,
+        output_filename=final_output_path.name,
     )
-    if completed.returncode != 0:
-        raise WorkflowExecutionError(f"Codex execution failed with exit code {completed.returncode}.")
+    set_active_context_audit(prepared.audit_id)
+    try:
+        argv, summary_prefix, provider, session_ref = _codex_exec_argv(
+            record,
+            step_run,
+            settings,
+            workspace_path=prepared.workspace_path,
+            output_path=prepared.output_path,
+        )
+        completed = run_command(
+            argv,
+            settings=settings,
+            cwd=str(prepared.workspace_path),
+            timeout=RUN_TIMEOUT_SECONDS,
+            log_prefix="codex",
+            record=record,
+            should_cancel=should_cancel,
+            set_active_process=set_active_process,
+        )
+        if completed.returncode != 0:
+            raise WorkflowExecutionError(f"Codex execution failed with exit code {completed.returncode}.")
 
-    set_agent_runtime_metadata(provider=provider, session_ref=session_ref)
-    final_message = ""
-    if record.last_message_path:
-        last_message_path = Path(record.last_message_path)
-        if last_message_path.exists():
-            final_message = last_message_path.read_text(encoding="utf-8").strip()
-    return trim_summary(f"{summary_prefix} {trim_summary(final_message) or ''}".strip()) or summary_prefix
+        finalize_step_context(prepared=prepared, final_output_path=final_output_path, record=record)
+        set_agent_runtime_metadata(provider=provider, session_ref=session_ref or str(final_output_path))
+        final_message = ""
+        if final_output_path.exists():
+            final_message = final_output_path.read_text(encoding="utf-8").strip()
+        return trim_summary(f"{summary_prefix} {trim_summary(final_message) or ''}".strip()) or summary_prefix
+    finally:
+        set_active_context_audit(None)
 
 def execute_step(
     record: WorkflowRunRecord,
@@ -147,7 +166,7 @@ def execute_step(
     if family == "research":
         return execute_research_backend(record, settings, should_cancel, set_active_process)
     if family == "implement":
-        return execute_codex_step(record, settings, should_cancel, set_active_process)
+        return execute_codex_step(record, step_run, settings, should_cancel, set_active_process)
     if family == "verify":
         return execute_verify_backend(record, step_run, settings, should_cancel, set_active_process)
     if family == "review":

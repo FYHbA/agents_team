@@ -1,4 +1,4 @@
-import { useMemo } from "react";
+import { useDeferredValue, useMemo } from "react";
 
 import type { Translator } from "../i18n";
 
@@ -40,7 +40,9 @@ type TraceStreamSummary = {
 };
 
 export function TraceLogViewer({ t, log, emptyLabel, formatDateTime }: TraceLogViewerProps) {
-  const entries = useMemo(() => parseTraceLog(log), [log]);
+  const deferredLog = useDeferredValue(log);
+  const entries = useMemo(() => parseTraceLog(deferredLog), [deferredLog]);
+  const refreshing = deferredLog !== log;
 
   if (!log.trim()) {
     return <div className="empty-state">{emptyLabel}</div>;
@@ -48,7 +50,10 @@ export function TraceLogViewer({ t, log, emptyLabel, formatDateTime }: TraceLogV
 
   return (
     <div className="trace-shell">
-      <p className="workflow-copy">{t("run.traceSummaryHint")}</p>
+      <p className="workflow-copy">
+        {refreshing ? `${t("common.refreshing")} ` : ""}
+        {t("run.traceSummaryHint")}
+      </p>
       {entries.length === 0 ? (
         <div className="empty-state">{emptyLabel}</div>
       ) : (

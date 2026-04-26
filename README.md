@@ -94,6 +94,7 @@ powershell -ExecutionPolicy Bypass -File scripts/dev-down.ps1
 - `POST /api/workflows/runs/{run_id}/execute`
 - `GET /api/workflows/runs/{run_id}/log`
 - `GET /api/workflows/runs/{run_id}/artifacts`
+- `GET /api/workflows/runs/{run_id}/context-audits`
 - `GET /api/workflows/runs/{run_id}/events`
 - `POST /api/workflows/runs/{run_id}/cancel`
 - `POST /api/workflows/runs/{run_id}/approve-dangerous`
@@ -125,7 +126,15 @@ Workflow runs now persist step-level execution state, attempt counts, cancellati
 Workflow execution now enters a persistent global SQLite-backed run queue before worker execution, so queued/running items can be claimed safely across backend processes and recovered after a backend restart instead of depending only on the original request thread.
 Run metadata, step ledger state, and cross-project run lookup metadata now also live in the same control-plane SQLite store instead of separate `run.json` and `run-index.json` files.
 Runs now also recall project/global memory at creation time, inject that context into workflow execution, and write fresh handoff memory back on terminal states.
+Codex-backed workflow steps no longer run directly inside the real project tree. They now execute inside isolated context workspaces under the global app home, with projected source files for edit-capable steps and generated `.agents-context/` state files for machine-readable handoffs.
+Those machine-readable handoffs are now persisted under each run as JSON contracts such as `research-result.json`, `verify-summary.json`, `review-result.json`, and `final-state.json`, while markdown artifacts remain human-facing renderings derived from those contracts.
+Every Codex-backed step also writes a context-audit record into the control-plane database so the backend can track which structured sources were exposed to the model, how many bytes were included, and whether any forbidden raw workflow files were requested.
+When the upstream `codex exec --json` stream includes usage data, those same context-audit records now also capture real `input_tokens`, `cached_input_tokens`, and `output_tokens`.
+Research can now also short-circuit a run when it determines the task is already covered by a recent successful run or already satisfied by the current project state. In that case the workflow skips later execution steps, still produces a final handoff, and records the run as `short_circuited` instead of pretending it was a normal completion.
+For near-duplicate tasks that still need a small follow-up, research can now emit `continue_with_delta`. The scheduler preserves the run, persists a structured delta scope, rewrites later step goals, trims command previews, and narrows verification lanes so implement / verify / review / report focus only on the remaining delta instead of replaying the full original workflow.
+The browser UI now surfaces both layers directly: the run artifact view can open the persisted JSON contracts, and diagnostics can show per-step context-audit summaries for the currently selected run.
 Queue items now carry worker ownership, heartbeats, and lease expiry so stuck claims can be detected and recovered safely.
+Queue diagnostics now also stay summary-first under longer dogfooding sessions: the dashboard keeps all counts, but only surfaces active work, recent terminal queue items, and the most relevant worker rows by default.
 Each workflow step now produces its own tracked agent-session record with backend identity, worker ownership, provider path, and lifecycle timestamps.
 Workflow planning now includes explicit dependency edges between steps, and matrix-style tasks can execute verification waves in parallel before review and reporting rejoin the graph.
 Parallel verification branches can now be emitted as separately claimed queue items so different workers inside the backend process can consume them concurrently instead of relying on one coordinator thread to execute the whole wave.

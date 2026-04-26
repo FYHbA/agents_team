@@ -239,6 +239,7 @@ class MemoryEntry(BaseModel):
     title: str
     summary: str
     details: str
+    promote_to_global_rule: bool = False
     tags: list[str] = Field(default_factory=list)
 
 
@@ -265,10 +266,20 @@ class WorkflowCommandPreview(BaseModel):
     source: Literal["verification", "codex_bridge"] = "verification"
     requires_confirmation: bool = False
     confirmed_at: str | None = None
+    delta_scoped: bool = False
+    scope_note: str | None = None
 
 
 class DangerousCommandApprovalRequest(BaseModel):
     command_ids: list[str] = Field(default_factory=list)
+
+
+class WorkflowDeltaScope(BaseModel):
+    focus_paths: list[str] = Field(default_factory=list)
+    matched_run_changed_files: list[str] = Field(default_factory=list)
+    current_diff_files: list[str] = Field(default_factory=list)
+    verification_focus: Literal["all", "tests", "build", "docs"] = "all"
+    scope_summary: str = ""
 
 
 class WorkflowStepRun(BaseModel):
@@ -296,7 +307,7 @@ class WorkflowStepRun(BaseModel):
 
 class WorkflowRunRecord(BaseModel):
     id: str
-    status: Literal["planned", "running", "completed", "failed", "cancelled"]
+    status: Literal["planned", "running", "completed", "failed", "cancelled", "short_circuited"]
     attempt_count: int = 0
     created_at: str
     updated_at: str
@@ -327,6 +338,12 @@ class WorkflowRunRecord(BaseModel):
     outputs: list[str]
     warnings: list[str]
     error: str | None = None
+    reuse_decision: Literal["continue", "stop_as_duplicate", "stop_as_already_satisfied", "continue_with_delta"] | None = None
+    matched_run_id: str | None = None
+    reuse_reason: str | None = None
+    reuse_confidence: float | None = None
+    delta_hint: str | None = None
+    delta_scope: WorkflowDeltaScope | None = None
     step_runs: list[WorkflowStepRun] = Field(default_factory=list)
     memory_context: WorkflowMemoryContext
     memory_guidance: WorkflowRoleMemoryGuidance
@@ -346,6 +363,132 @@ class WorkflowRunDeleteResponse(BaseModel):
     deleted_at: str
 
 
+class ContractMemorySummary(BaseModel):
+    scope: Literal["project", "global"]
+    title: str
+    summary: str
+    created_at: str | None = None
+
+
+class ResearchResultContract(BaseModel):
+    decision: Literal["continue", "stop_as_duplicate", "stop_as_already_satisfied", "continue_with_delta"] = "continue"
+    matched_run_id: str | None = None
+    confidence: float = 0.0
+    reason: str = ""
+    delta_hint: str = ""
+    delta_scope: WorkflowDeltaScope | None = None
+    run_id: str
+    task: str
+    project_root: str
+    top_level_entries: list[str] = Field(default_factory=list)
+    relevant_hotspots: list[str] = Field(default_factory=list)
+    continuity_notes: list[str] = Field(default_factory=list)
+    suggested_next_attention_areas: list[str] = Field(default_factory=list)
+    summary: str
+
+
+class VerifyCommandResultContract(BaseModel):
+    label: str
+    status: Literal["completed", "failed", "skipped"]
+    exit_code: int | None = None
+    output_excerpt: str | None = None
+
+
+class VerifySummaryContract(BaseModel):
+    run_id: str
+    step_id: str
+    task: str
+    executed_commands: list[VerifyCommandResultContract] = Field(default_factory=list)
+    result_summary: str
+    validation_risks: list[str] = Field(default_factory=list)
+    follow_up_checks: list[str] = Field(default_factory=list)
+    summary: str
+
+
+class ReviewResultContract(BaseModel):
+    run_id: str
+    task: str
+    reviewer_memory_cross_checks: list[str] = Field(default_factory=list)
+    changed_files: list[str] = Field(default_factory=list)
+    risk_assessment: list[str] = Field(default_factory=list)
+    open_questions: list[str] = Field(default_factory=list)
+    git_status_excerpt: str | None = None
+    diff_stat_excerpt: str | None = None
+    summary: str
+
+
+class FinalStateStepOutcomeContract(BaseModel):
+    step_id: str
+    title: str
+    status: str
+    summary: str | None = None
+
+
+class FinalStateContract(BaseModel):
+    run_id: str
+    task: str
+    status: str
+    attempt_count: int
+    reuse_decision: str | None = None
+    matched_run_id: str | None = None
+    reuse_reason: str | None = None
+    reuse_confidence: float | None = None
+    delta_hint: str | None = None
+    delta_scope: WorkflowDeltaScope | None = None
+    step_outcomes: list[FinalStateStepOutcomeContract] = Field(default_factory=list)
+    memory_recall: list[ContractMemorySummary] = Field(default_factory=list)
+    codex_final_message: str | None = None
+    change_summary_excerpt: str | None = None
+    memory_writes: list[ContractMemorySummary] = Field(default_factory=list)
+    promoted_global_rules: list[str] = Field(default_factory=list)
+    warnings: list[str] = Field(default_factory=list)
+    summary: str
+
+
+class WorkflowContextAuditSourceRecord(BaseModel):
+    key: str
+    path: str
+    bytes: int
+
+
+class WorkflowContextAuditRecord(BaseModel):
+    id: str
+    run_id: str
+    step_id: str
+    agent_role: str
+    backend: Literal[
+        "planner_backend",
+        "research_backend",
+        "codex_backend",
+        "verify_backend",
+        "reviewer_backend",
+        "reporter_backend",
+    ]
+    workspace_path: str
+    input_sources: list[WorkflowContextAuditSourceRecord] = Field(default_factory=list)
+    input_bytes: int
+    memory_item_count: int
+    raw_log_bytes_included: int
+    markdown_artifact_bytes_included: int
+    forbidden_source_attempts: int = 0
+    input_tokens: int | None = None
+    cached_tokens: int | None = None
+    output_tokens: int | None = None
+    created_at: str
+    updated_at: str
+
+
+class WorkflowRunContextAuditsResponse(BaseModel):
+    run_id: str
+    audits: list[WorkflowContextAuditRecord] = Field(default_factory=list)
+    total_input_bytes: int = 0
+    total_forbidden_source_attempts: int = 0
+    total_memory_items: int = 0
+    total_input_tokens: int | None = None
+    total_cached_tokens: int | None = None
+    total_output_tokens: int | None = None
+
+
 class WorkflowArtifactDocument(BaseModel):
     key: Literal[
         "planning_brief",
@@ -356,10 +499,14 @@ class WorkflowArtifactDocument(BaseModel):
         "verification_brief",
         "parallel_branches",
         "memory_context",
+        "research_result",
+        "verify_summary",
+        "review_result",
+        "final_state",
     ]
     title: str
     path: str | None
-    content_type: Literal["markdown", "text"]
+    content_type: Literal["markdown", "text", "json"]
     available: bool
     content: str
 
@@ -410,6 +557,8 @@ class WorkflowQueueDashboardResponse(BaseModel):
     terminal_count: int
     stale_count: int
     stale_worker_count: int = 0
+    hidden_terminal_count: int = 0
+    hidden_worker_count: int = 0
 
 
 class WorkflowAgentCommandRecord(BaseModel):

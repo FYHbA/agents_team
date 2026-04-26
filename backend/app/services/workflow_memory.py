@@ -37,19 +37,6 @@ STOPWORDS = {
     "generate",
     "implement",
 }
-GLOBAL_RULE_CUE_PHRASES = (
-    "always",
-    "never",
-    "remember",
-    "ensure",
-    "must",
-    "should",
-    "re-run",
-    "rerun",
-    "double-check",
-)
-
-
 def _memory_dir(path: Path) -> Path:
     path.mkdir(parents=True, exist_ok=True)
     return path
@@ -122,11 +109,19 @@ def build_memory_context(project_path_str: str, task: str, settings: Settings, *
     project_entries = _load_entries(project_path_memory)
     global_entries = _load_entries(global_path_memory) if global_path_memory else []
 
+    recalled_project = _recall_entries(project_entries, task)[:MAX_RECALLED_ENTRIES]
+    remaining_global_slots = max(0, MAX_RECALLED_ENTRIES - len(recalled_project))
+    recalled_global = (
+        _recall_entries(global_entries, task)[:remaining_global_slots]
+        if global_enabled and remaining_global_slots
+        else []
+    )
+
     return WorkflowMemoryContext(
         project_memory_path=str(project_path_memory),
         global_memory_path=str(global_path_memory) if global_path_memory else None,
-        recalled_project=_recall_entries(project_entries, task),
-        recalled_global=_recall_entries(global_entries, task) if global_enabled else [],
+        recalled_project=recalled_project,
+        recalled_global=recalled_global,
         written_project=[],
         written_global=[],
     )
@@ -327,10 +322,7 @@ def _step_finding_entry(record: WorkflowRunRecord, step_run: WorkflowStepRun) ->
 
 
 def _should_promote_to_global_rule(finding: MemoryEntry) -> bool:
-    text = " ".join([finding.title, finding.summary, finding.details]).lower()
-    if finding.entry_kind == "verification_finding" and finding.step_status == "failed":
-        return True
-    return any(phrase in text for phrase in GLOBAL_RULE_CUE_PHRASES)
+    return bool(finding.promote_to_global_rule)
 
 
 def _global_rule_entry(finding: MemoryEntry) -> MemoryEntry:

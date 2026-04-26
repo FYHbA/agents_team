@@ -4,7 +4,16 @@ import subprocess
 from pathlib import Path
 
 from app.models.dto import WorkflowArtifactDocument, WorkflowRunArtifactsResponse, WorkflowRunRecord
-from app.services.workflow_artifact_paths import parallel_branches_path, planning_brief_path, project_snapshot_path, verification_brief_path
+from app.services.workflow_artifact_paths import (
+    final_state_path,
+    parallel_branches_path,
+    planning_brief_path,
+    project_snapshot_path,
+    research_result_path,
+    review_result_path,
+    verify_summary_path,
+    verification_brief_path,
+)
 from app.services.workflow_memory import memory_context_markdown
 
 
@@ -333,6 +342,10 @@ def _artifact_documents(record: WorkflowRunRecord) -> list[WorkflowArtifactDocum
         ("verification_brief", "Verification brief", verification_brief_path(record), "markdown"),
         ("parallel_branches", "Parallel branches", branch_summary_path, "markdown"),
         ("memory_context", "Workflow memory", memory_context_path, "markdown"),
+        ("research_result", "Research contract", research_result_path(record), "json"),
+        ("verify_summary", "Verify contract", verify_summary_path(record), "json"),
+        ("review_result", "Review contract", review_result_path(record), "json"),
+        ("final_state", "Final-state contract", final_state_path(record), "json"),
     ]
 
     documents: list[WorkflowArtifactDocument] = []

@@ -31,7 +31,7 @@ export function ArtifactDocumentViewer({ document, emptyLabel, blocks: providedB
     return <div className="empty-state">{emptyLabel}</div>;
   }
 
-  if (document.content_type === "text") {
+  if (document.content_type === "text" || document.content_type === "json") {
     return <pre className="artifact-viewer text">{document.content}</pre>;
   }
 

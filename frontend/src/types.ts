@@ -115,6 +115,16 @@ export type WorkflowCommandPreview = {
   source: "verification" | "codex_bridge";
   requires_confirmation: boolean;
   confirmed_at: string | null;
+  delta_scoped: boolean;
+  scope_note: string | null;
+};
+
+export type WorkflowDeltaScope = {
+  focus_paths: string[];
+  matched_run_changed_files: string[];
+  current_diff_files: string[];
+  verification_focus: "all" | "tests" | "build" | "docs";
+  scope_summary: string;
 };
 
 export type WorkflowStep = {
@@ -148,6 +158,7 @@ export type MemoryEntry = {
   title: string;
   summary: string;
   details: string;
+  promote_to_global_rule: boolean;
   tags: string[];
 };
 
@@ -204,7 +215,7 @@ export type WorkflowPlan = {
 
 export type WorkflowRun = {
   id: string;
-  status: "planned" | "running" | "completed" | "failed" | "cancelled";
+  status: "planned" | "running" | "completed" | "failed" | "cancelled" | "short_circuited";
   attempt_count: number;
   created_at: string;
   updated_at: string;
@@ -235,6 +246,12 @@ export type WorkflowRun = {
   outputs: string[];
   warnings: string[];
   error: string | null;
+  reuse_decision: "continue" | "stop_as_duplicate" | "stop_as_already_satisfied" | "continue_with_delta" | null;
+  matched_run_id: string | null;
+  reuse_reason: string | null;
+  reuse_confidence: number | null;
+  delta_hint: string | null;
+  delta_scope: WorkflowDeltaScope | null;
   step_runs: WorkflowStepRun[];
   memory_context: WorkflowMemoryContext;
   memory_guidance: WorkflowRoleMemoryGuidance;
@@ -269,10 +286,14 @@ export type WorkflowArtifactDocument = {
     | "project_snapshot"
     | "verification_brief"
     | "parallel_branches"
-    | "memory_context";
+    | "memory_context"
+    | "research_result"
+    | "verify_summary"
+    | "review_result"
+    | "final_state";
   title: string;
   path: string | null;
-  content_type: "markdown" | "text";
+  content_type: "markdown" | "text" | "json";
   available: boolean;
   content: string;
 };
@@ -280,6 +301,49 @@ export type WorkflowArtifactDocument = {
 export type WorkflowRunArtifacts = {
   run_id: string;
   documents: WorkflowArtifactDocument[];
+};
+
+export type WorkflowContextAuditSource = {
+  key: string;
+  path: string;
+  bytes: number;
+};
+
+export type WorkflowContextAudit = {
+  id: string;
+  run_id: string;
+  step_id: string;
+  agent_role: string;
+  backend:
+    | "planner_backend"
+    | "research_backend"
+    | "codex_backend"
+    | "verify_backend"
+    | "reviewer_backend"
+    | "reporter_backend";
+  workspace_path: string;
+  input_sources: WorkflowContextAuditSource[];
+  input_bytes: number;
+  memory_item_count: number;
+  raw_log_bytes_included: number;
+  markdown_artifact_bytes_included: number;
+  forbidden_source_attempts: number;
+  input_tokens: number | null;
+  cached_tokens: number | null;
+  output_tokens: number | null;
+  created_at: string;
+  updated_at: string;
+};
+
+export type WorkflowRunContextAudits = {
+  run_id: string;
+  audits: WorkflowContextAudit[];
+  total_input_bytes: number;
+  total_forbidden_source_attempts: number;
+  total_memory_items: number;
+  total_input_tokens: number | null;
+  total_cached_tokens: number | null;
+  total_output_tokens: number | null;
 };
 
 export type WorkflowQueueItem = {
@@ -323,6 +387,8 @@ export type WorkflowQueueDashboard = {
   terminal_count: number;
   stale_count: number;
   stale_worker_count: number;
+  hidden_terminal_count: number;
+  hidden_worker_count: number;
 };
 
 export type WorkflowAgentSession = {

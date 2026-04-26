@@ -146,6 +146,29 @@ def read_pid(name: str) -> int | None:
     return int(pid) if isinstance(pid, int) else None
 
 
+def _status_snapshot(name: str) -> dict[str, object]:
+    port = int(SERVICES[name]["port"])
+    recorded_pid = read_pid(name)
+    listening_pid = pid_for_port(port)
+    listener_running = bool(listening_pid and process_exists(listening_pid))
+    recorded_running = bool(recorded_pid and process_exists(recorded_pid))
+    port_running = port_open(port)
+    active_pid = listening_pid if listener_running else recorded_pid if recorded_running else listening_pid or recorded_pid
+    pid_source = "listener" if listener_running else "pid_file" if recorded_running else "listener" if listening_pid else "pid_file" if recorded_pid else None
+    pid_mismatch = bool(recorded_pid and listening_pid and recorded_pid != listening_pid)
+    running = port_running or listener_running or recorded_running
+    return {
+        "service": name,
+        "port": port,
+        "state": "running" if running else "stopped",
+        "pid": active_pid,
+        "recorded_pid": recorded_pid,
+        "listening_pid": listening_pid,
+        "pid_source": pid_source,
+        "pid_mismatch": pid_mismatch,
+    }
+
+
 def start_service(name: str) -> None:
     ensure_dirs()
     service = SERVICES[name]
@@ -181,7 +204,8 @@ def start_service(name: str) -> None:
 
 
 def stop_service(name: str) -> None:
-    pid = read_pid(name) or pid_for_port(SERVICES[name]["port"])
+    snapshot = _status_snapshot(name)
+    pid = snapshot["listening_pid"] or snapshot["recorded_pid"]
     if pid is None:
         print(f"{name} pid file not found.")
         return
@@ -198,22 +222,21 @@ def stop_service(name: str) -> None:
 
 
 def status_service(name: str) -> dict[str, object]:
-    pid = read_pid(name) or pid_for_port(SERVICES[name]["port"])
-    port = SERVICES[name]["port"]
-    running = port_open(port) or bool(pid and process_exists(pid))
+    snapshot = _status_snapshot(name)
     return {
-        "service": name,
-        "port": port,
-        "state": "running" if running else "stopped",
-        "pid": pid,
+        "service": snapshot["service"],
+        "port": snapshot["port"],
+        "state": snapshot["state"],
+        "pid": snapshot["pid"],
+        "note": "pid file differs from live listener" if snapshot["pid_mismatch"] else "",
     }
 
 
 def print_status() -> None:
     rows = [status_service("backend"), status_service("frontend")]
-    print(f"{'service':<10} {'port':<6} {'state':<8} {'pid':<8}")
+    print(f"{'service':<10} {'port':<6} {'state':<8} {'pid':<8} note")
     for row in rows:
-        print(f"{row['service']:<10} {row['port']:<6} {row['state']:<8} {str(row['pid'] or ''):<8}")
+        print(f"{row['service']:<10} {row['port']:<6} {row['state']:<8} {str(row['pid'] or ''):<8} {row['note']}")
 
 
 def main() -> int:

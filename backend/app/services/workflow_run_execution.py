@@ -16,10 +16,12 @@ from app.services.workflow_agent_sessions import (
     finish_agent_session,
     start_agent_session,
 )
+from app.services.workflow_contracts import build_local_research_result_contract, load_research_result_contract, write_research_result_contract
 from app.services.workflow_backend_exceptions import WorkflowCancellationRequested, WorkflowExecutionError
 from app.services.workflow_backend_reporter import execute_reporter_backend
 from app.services.workflow_backend_registry import step_family
 from app.services.workflow_memory import persist_run_memory, persist_step_finding
+from app.services.workflow_reuse import infer_reuse_decision
 from app.services.workflow_run_steps import execute_step
 from app.services.workflow_run_queue import (
     DEFAULT_WORKER_LEASE_SECONDS,
@@ -336,6 +338,51 @@ def _sync_dangerous_confirmation_state(record: WorkflowRunRecord) -> None:
     record.dangerous_commands_confirmed_at = None
 
 
+def _delta_preview_scope_note(record: WorkflowRunRecord) -> str | None:
+    if record.delta_scope is None:
+        return None
+    parts: list[str] = []
+    if record.delta_scope.focus_paths:
+        parts.append("Focus paths: " + ", ".join(record.delta_scope.focus_paths[:4]))
+    if record.delta_scope.scope_summary:
+        parts.append(record.delta_scope.scope_summary)
+    return " ".join(parts).strip() or None
+
+
+def _preview_allowed_for_delta(step_id: str, verification_focus: str) -> bool:
+    family = step_family(step_id)
+    if family != "verify":
+        return True
+    if step_id == "verify_tests":
+        return verification_focus in {"all", "tests"}
+    if step_id == "verify_build":
+        return verification_focus in {"all", "build"}
+    return verification_focus != "docs"
+
+
+def _apply_delta_scope_to_previews(record: WorkflowRunRecord) -> None:
+    if record.delta_scope is None:
+        return
+    verification_focus = record.delta_scope.verification_focus
+    scope_note = _delta_preview_scope_note(record)
+
+    def mutate(step_like) -> None:
+        filtered_previews = [
+            preview
+            for preview in step_like.command_previews
+            if _preview_allowed_for_delta(step_like.id if hasattr(step_like, "id") else step_like.step_id, verification_focus)
+        ]
+        for preview in filtered_previews:
+            preview.delta_scoped = True
+            preview.scope_note = scope_note
+        step_like.command_previews = filtered_previews
+
+    for step in record.steps:
+        mutate(step)
+    for step_run in record.step_runs:
+        mutate(step_run)
+
+
 def _ensure_dangerous_commands_are_confirmed(record: WorkflowRunRecord, mode: RunMode) -> None:
     if not record.requires_dangerous_command_confirmation:
         return
@@ -386,7 +433,7 @@ def _prepare_run_attempt(
     else:
         if record.status == "running" and (live_thread or active_queue_item):
             raise HTTPException(status_code=409, detail=f"Run is still active and cannot be retried: {record.id}")
-        if record.status not in {"failed", "cancelled"}:
+        if record.status not in {"failed", "cancelled", "short_circuited"}:
             raise HTTPException(status_code=409, detail=f"Run cannot be retried from status `{record.status}`.")
         _ensure_dangerous_commands_are_confirmed(record, mode)
         _prepare_for_retry(record)
@@ -402,6 +449,12 @@ def _prepare_run_attempt(
     record.error = None
     record.memory_context.written_project = []
     record.memory_context.written_global = []
+    record.reuse_decision = None
+    record.matched_run_id = None
+    record.reuse_reason = None
+    record.reuse_confidence = None
+    record.delta_hint = None
+    record.delta_scope = None
     record.updated_at = now
     save_record(record, settings)
     append_log(record, f"Workflow {mode} started for run `{record.id}` on attempt `{record.attempt_count}`.")
@@ -412,7 +465,7 @@ def _finalize_run(
     record: WorkflowRunRecord,
     settings: Settings,
     *,
-    status: Literal["completed", "failed", "cancelled"],
+    status: Literal["completed", "failed", "cancelled", "short_circuited"],
     message: str,
     error: str | None = None,
 ) -> WorkflowRunRecord:
@@ -477,6 +530,105 @@ def _finalize_cancelled_run(
         _mark_step_finished(record, report_step, "completed", settings, summary=summary)
 
     return _finalize_run(record, settings, status="cancelled", message=f"Workflow execution cancelled: {reason}")
+
+
+def _research_short_circuit_contract(record: WorkflowRunRecord):
+    research_step = next((step_run for step_run in record.step_runs if step_run.step_id == "research"), None)
+    if research_step is None or research_step.status != "completed":
+        return None
+    contract = load_research_result_contract(record)
+    if contract is None:
+        return None
+    if contract.decision not in {"stop_as_duplicate", "stop_as_already_satisfied"}:
+        return None
+    return contract
+
+
+def _apply_research_short_circuit(record: WorkflowRunRecord, settings: Settings) -> None:
+    contract = _research_short_circuit_contract(record)
+    if contract is None:
+        return
+    if record.reuse_decision == contract.decision and record.matched_run_id == contract.matched_run_id:
+        return
+    record.reuse_decision = contract.decision
+    record.matched_run_id = contract.matched_run_id
+    record.reuse_reason = contract.reason or None
+    record.reuse_confidence = contract.confidence
+    record.delta_hint = contract.delta_hint or None
+    record.delta_scope = None
+    summary = contract.reason or (
+        "Research concluded that this task is already covered by a prior successful run and later workflow steps are being skipped."
+    )
+    for step_run in record.step_runs:
+        if step_family(step_run.step_id) in {"plan", "research", "report"}:
+            continue
+        if step_run.status == "pending":
+            _mark_step_skipped(record, step_run, settings, f"Skipped because research returned `{contract.decision}`. {summary}")
+    record.updated_at = now_iso()
+    append_log(
+        record,
+        "Workflow short-circuit triggered by research decision "
+        f"`{contract.decision}`"
+        + (f" matched to `{contract.matched_run_id}`." if contract.matched_run_id else "."),
+    )
+    if summary:
+        append_log(record, summary)
+    save_record(record, settings)
+
+
+def _apply_research_delta_narrowing(record: WorkflowRunRecord, settings: Settings) -> None:
+    research_step = next((step_run for step_run in record.step_runs if step_run.step_id == "research"), None)
+    if research_step is None or research_step.status != "completed":
+        return
+    contract = load_research_result_contract(record)
+    if contract is None or contract.decision != "continue_with_delta":
+        return
+    if record.reuse_decision == contract.decision and record.matched_run_id == contract.matched_run_id:
+        return
+    record.reuse_decision = contract.decision
+    record.matched_run_id = contract.matched_run_id
+    record.reuse_reason = contract.reason or None
+    record.reuse_confidence = contract.confidence
+    record.delta_hint = contract.delta_hint or None
+    record.delta_scope = contract.delta_scope
+
+    goal_suffix = (
+        contract.delta_scope.scope_summary
+        if contract.delta_scope is not None and contract.delta_scope.scope_summary
+        else contract.delta_hint
+        or contract.reason
+        or "Continue only on the remaining delta from the matched prior run."
+    )
+
+    def rewrite_goal(step_id: str, prefix: str) -> None:
+        for step in record.steps:
+            if step.id == step_id:
+                step.goal = f"{prefix} {goal_suffix}".strip()
+        for step_run in record.step_runs:
+            if step_run.step_id == step_id and step_run.status == "pending":
+                step_run.goal = f"{prefix} {goal_suffix}".strip()
+
+    rewrite_goal("implement", "Apply only the remaining delta that still separates the current project from the matched prior run.")
+    for step_id in ("verify", "verify_tests", "verify_build"):
+        rewrite_goal(step_id, "Verify only the narrowed delta path and confirm the matched prior result still holds where unchanged.")
+    rewrite_goal("review", "Review only the narrowed delta path, with explicit cross-checks against the matched prior run.")
+    rewrite_goal("report", "Explain which prior run was reused, what remaining delta was processed, and why the workflow was narrowed.")
+    _apply_delta_scope_to_previews(record)
+
+    append_log(
+        record,
+        "Workflow delta narrowing triggered by research decision "
+        f"`{contract.decision}`"
+        + (f" matched to `{contract.matched_run_id}`." if contract.matched_run_id else "."),
+    )
+    if contract.reason:
+        append_log(record, contract.reason)
+    if contract.delta_hint:
+        append_log(record, f"Delta hint: {contract.delta_hint}")
+    if contract.delta_scope is not None and contract.delta_scope.scope_summary:
+        append_log(record, f"Delta scope: {contract.delta_scope.scope_summary}")
+    record.updated_at = now_iso()
+    save_record(record, settings)
 
 
 def _completed_step_ids(record: WorkflowRunRecord) -> set[str]:
@@ -648,11 +800,43 @@ def _enqueue_parallel_step_wave(record: WorkflowRunRecord, step_runs: list[Workf
     )
 
 
-def _final_run_status(record: WorkflowRunRecord) -> Literal["completed", "failed"]:
+def _final_run_status(record: WorkflowRunRecord) -> Literal["completed", "failed", "short_circuited"]:
+    if record.reuse_decision in {"stop_as_duplicate", "stop_as_already_satisfied"}:
+        return "short_circuited"
     non_report_steps = [step_run for step_run in record.step_runs if step_family(step_run.step_id) != "report"]
     if any(step_run.status in {"failed", "skipped", "cancelled"} for step_run in non_report_steps):
         return "failed"
     return "completed"
+
+
+def _maybe_preflight_reuse_research_completion(
+    record: WorkflowRunRecord,
+    settings: Settings,
+) -> bool:
+    research_step = next((step_run for step_run in record.step_runs if step_run.step_id == "research"), None)
+    if research_step is None or research_step.status != "pending":
+        return False
+    if any(step_lookup(record, dependency_id).status != "completed" for dependency_id in research_step.depends_on):
+        return False
+    decision, matched_run_id, confidence, reason, delta_hint, delta_scope = infer_reuse_decision(record, settings)
+    if decision not in {"stop_as_duplicate", "stop_as_already_satisfied"}:
+        return False
+    contract = build_local_research_result_contract(
+        record,
+        top_level_entries=[],
+        decision=decision,
+        matched_run_id=matched_run_id,
+        confidence=confidence,
+        reason=reason,
+        delta_hint=delta_hint,
+        delta_scope=delta_scope,
+    )
+    _mark_step_running(record, research_step, settings)
+    write_research_result_contract(record, contract)
+    _mark_step_finished(record, research_step, "completed", settings, summary=contract.summary)
+    latest_record = get_workflow_run(record.id, record.project_path, settings)
+    _apply_research_short_circuit(latest_record, settings)
+    return True
 
 
 def _execute_workflow_run(
@@ -707,6 +891,9 @@ def _execute_workflow_run(
                 _mark_step_skipped(record, step_run, settings, "Skipped because the workflow graph stalled.")
             break
 
+        if _maybe_preflight_reuse_research_completion(record, settings):
+            continue
+
         wave = _select_step_wave(ready_steps)
         if queue_parallel_branches and len(wave) > 1 and all(step.execution == "parallel" for step in wave):
             _enqueue_parallel_step_wave(record, wave, settings)
@@ -714,6 +901,9 @@ def _execute_workflow_run(
         wave_error, wave_cancel = _execute_step_wave(record, wave, settings, run_id, state_lock)
         if wave_cancel and _is_cancel_requested(run_id):
             cancel_message = wave_cancel
+        record = get_workflow_run(run_id, project_path_str, settings)
+        _apply_research_short_circuit(record, settings)
+        _apply_research_delta_narrowing(record, settings)
 
     record = get_workflow_run(run_id, project_path_str, settings)
     report_step = step_lookup(record, "report")
@@ -738,6 +928,15 @@ def _execute_workflow_run(
         _finalize_run(record, settings, status="cancelled", message=f"Workflow execution cancelled: {cancel_message}")
         return
     final_status = _final_run_status(record)
+    if final_status == "short_circuited":
+        _finalize_run(
+            record,
+            settings,
+            status="short_circuited",
+            message=record.reuse_reason
+            or "Workflow ended early because research determined the task was already satisfied or duplicated.",
+        )
+        return
     if final_status == "failed":
         _finalize_run(
             record,
@@ -1102,6 +1301,8 @@ def cancel_workflow_run(run_id: str, project_path_str: str | None, settings: Set
         return record
     if record.status == "completed":
         raise HTTPException(status_code=409, detail=f"Completed runs cannot be cancelled: {record.id}")
+    if record.status == "short_circuited":
+        raise HTTPException(status_code=409, detail=f"Short-circuited runs cannot be cancelled: {record.id}")
     if record.status == "failed":
         raise HTTPException(status_code=409, detail=f"Failed runs cannot be cancelled; retry or resume instead: {record.id}")
 

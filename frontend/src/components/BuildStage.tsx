@@ -175,6 +175,7 @@ export function BuildStage({
                           <article key={`${step.id}-${preview.label}-${preview.argv.join(" ")}`} className="command-item">
                             <strong>{preview.label}</strong>
                             <code>{preview.argv.join(" ")}</code>
+                            {preview.scope_note ? <span>{preview.scope_note}</span> : null}
                           </article>
                         ))}
                       </div>

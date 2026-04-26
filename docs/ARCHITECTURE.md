@@ -87,6 +87,18 @@ Use `<project>/.agents-team/` for:
 - artifact indexes
 - project-local control-plane mirror/export snapshots
 
+### Workflow context isolation
+
+- Codex-backed workflow steps should receive their context through a backend-controlled gateway rather than by reading `.agents-team/` history directly
+- the backend should materialize a per-step isolated workspace under the global app home
+- read-only role backends should see only generated `.agents-context/` state files
+- edit-capable steps may also receive a projected source workspace, but that projection must exclude `.agents-team/`, raw logs, memory stores, and other runtime-heavy or recursive context sources
+- machine-readable handoffs between steps should persist as structured JSON contracts such as `research-result.json`, `verify-summary.json`, `review-result.json`, and `final-state.json`
+- human-facing markdown artifacts should be rendered from those contracts instead of serving as the canonical machine handoff format
+- research should be able to emit a structured reuse/duplicate decision so the scheduler can short-circuit later workflow steps when a recent successful run already satisfies the task
+- reuse decisions should support both full short-circuit (`stop_as_duplicate`, `stop_as_already_satisfied`) and narrowed continuation (`continue_with_delta`) so similar tasks can collapse into a delta-only execution path instead of replaying the full workflow
+- narrowed continuation should persist a structured delta scope, so downstream step context, command previews, and verification behavior can all stay aligned on the same remaining surface area instead of relying only on prose hints
+
 ## Codex integration
 
 ### Preferred order
@@ -131,6 +143,8 @@ CLI and service entry points are a safer integration boundary.
 - branch failure policy should be explicit: some downstream steps such as review may continue on failed verification branches while the overall run still resolves to failed
 - backend startup should recover interrupted queue items and orphaned running runs
 - synchronous execution paths may still exist for tests, but product traffic should flow through the queue worker
+- every Codex-backed step should also emit a context-audit record that captures structured input sources, input bytes, recalled-memory count, and forbidden-source access attempts so context cost can be inspected after the run
+- operator diagnostics should stay summary-first under long-running dogfooding: preserve full counts, but default the queue/worker dashboard to active items plus a compact recent-history slice
 
 ## First implementation target
 

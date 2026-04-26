@@ -37,6 +37,9 @@ class WorkflowQueueItem(TypedDict):
 
 DEFAULT_WORKER_LEASE_SECONDS = 20
 STALE_WORKER_GRACE_MULTIPLIER = 2
+DASHBOARD_TERMINAL_ITEM_LIMIT = 8
+DASHBOARD_IDLE_WORKER_LIMIT = 4
+WORKER_HISTORY_RETENTION_HOURS = 12
 
 
 def workflow_queue_path(settings: Settings):
@@ -453,17 +456,30 @@ def heartbeat_workflow_queue_item(
 
 def get_workflow_queue_dashboard(settings: Settings) -> WorkflowQueueDashboardResponse:
     _cleanup_stale_runtime_state(settings)
-    items = [WorkflowQueueItemRecord.model_validate(item) for item in read_workflow_queue(settings)]
-    workers = list_workflow_workers(settings)
-    stale_count = sum(1 for item in items if _is_stale(item.lease_expires_at, item.status))
+    all_items = [WorkflowQueueItemRecord.model_validate(item) for item in read_workflow_queue(settings)]
+    active_items = [item for item in all_items if item.status in {"queued", "running"}]
+    terminal_items = sorted(
+        [item for item in all_items if item.status in {"completed", "failed", "cancelled"}],
+        key=lambda item: item.updated_at,
+        reverse=True,
+    )
+    items = active_items + terminal_items[:DASHBOARD_TERMINAL_ITEM_LIMIT]
+
+    all_workers = list_workflow_workers(settings)
+    attention_workers = [worker for worker in all_workers if worker.status in {"running", "stale"}]
+    idle_workers = [worker for worker in all_workers if worker.status == "idle"]
+    workers = attention_workers + idle_workers[:DASHBOARD_IDLE_WORKER_LIMIT]
+    stale_count = sum(1 for item in all_items if _is_stale(item.lease_expires_at, item.status))
     return WorkflowQueueDashboardResponse(
         items=items,
         workers=workers,
-        queued_count=sum(1 for item in items if item.status == "queued"),
-        running_count=sum(1 for item in items if item.status == "running"),
-        terminal_count=sum(1 for item in items if item.status in {"completed", "failed", "cancelled"}),
+        queued_count=sum(1 for item in all_items if item.status == "queued"),
+        running_count=sum(1 for item in all_items if item.status == "running"),
+        terminal_count=sum(1 for item in all_items if item.status in {"completed", "failed", "cancelled"}),
         stale_count=stale_count,
-        stale_worker_count=sum(1 for worker in workers if worker.status == "stale"),
+        stale_worker_count=sum(1 for worker in all_workers if worker.status == "stale"),
+        hidden_terminal_count=max(len(terminal_items) - DASHBOARD_TERMINAL_ITEM_LIMIT, 0),
+        hidden_worker_count=max(len(all_workers) - len(workers), 0),
     )
 
 
@@ -607,6 +623,7 @@ def _cleanup_stale_runtime_state(settings: Settings) -> tuple[int, int]:
         connection.execute("BEGIN IMMEDIATE")
         requeued = _requeue_expired_running_items(connection)
         stale_workers = _mark_stale_workers(connection)
+        _prune_historical_workers(connection)
         connection.commit()
         return requeued, stale_workers
     except Exception:
@@ -632,5 +649,20 @@ def _requeue_all_running_items(connection: sqlite3.Connection) -> int:
         WHERE status = 'running'
         """,
         (requeued_at,),
+    )
+    return int(cursor.rowcount)
+
+
+def _prune_historical_workers(connection: sqlite3.Connection) -> int:
+    cutoff = (datetime.now(timezone.utc) - timedelta(hours=WORKER_HISTORY_RETENTION_HOURS)).isoformat()
+    cursor = connection.execute(
+        """
+        DELETE FROM workflow_workers
+        WHERE status IN ('idle', 'stale')
+          AND current_item_id IS NULL
+          AND current_run_id IS NULL
+          AND last_heartbeat_at < ?
+        """,
+        (cutoff,),
     )
     return int(cursor.rowcount)

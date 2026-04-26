@@ -187,6 +187,35 @@ def _create_schema(connection: sqlite3.Connection) -> None:
         ON workflow_agent_session_events (run_id, sequence ASC)
         """
     )
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS workflow_context_audits (
+            id TEXT PRIMARY KEY,
+            run_id TEXT NOT NULL,
+            step_id TEXT NOT NULL,
+            agent_role TEXT NOT NULL,
+            backend TEXT NOT NULL,
+            workspace_path TEXT NOT NULL,
+            input_sources_json TEXT NOT NULL,
+            input_bytes INTEGER NOT NULL,
+            memory_item_count INTEGER NOT NULL,
+            raw_log_bytes_included INTEGER NOT NULL,
+            markdown_artifact_bytes_included INTEGER NOT NULL,
+            forbidden_source_attempts INTEGER NOT NULL DEFAULT 0,
+            input_tokens INTEGER NULL,
+            cached_tokens INTEGER NULL,
+            output_tokens INTEGER NULL,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        )
+        """
+    )
+    connection.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_workflow_context_audits_run_step
+        ON workflow_context_audits (run_id, step_id, created_at DESC)
+        """
+    )
 
 
 def _ensure_column(connection: sqlite3.Connection, table_name: str, column_name: str, column_spec: str) -> None:

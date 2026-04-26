@@ -12,6 +12,7 @@ import type {
   WorkflowPlan,
   WorkflowQueueDashboard,
   WorkflowRunArtifacts,
+  WorkflowRunContextAudits,
   WorkflowAgentSession,
   WorkflowRunEvent,
   WorkflowRunDeleteResult,
@@ -264,6 +265,10 @@ export function getWorkflowRunArtifacts(runId: string, projectPath?: string): Pr
   return fetchJson<WorkflowRunArtifacts>(
     `/api/workflows/runs/${encodeURIComponent(runId)}/artifacts?project_path=${encodeURIComponent(projectPath)}`,
   );
+}
+
+export function getWorkflowRunContextAudits(runId: string): Promise<WorkflowRunContextAudits> {
+  return fetchJson<WorkflowRunContextAudits>(`/api/workflows/runs/${encodeURIComponent(runId)}/context-audits`);
 }
 
 export function getWorkflowRunEventsUrl(runId: string, projectPath?: string, tail = 200): string {

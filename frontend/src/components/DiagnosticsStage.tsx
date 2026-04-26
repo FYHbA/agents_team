@@ -1,4 +1,4 @@
-import type { WorkflowQueueDashboard, WorkflowQueueItem } from "../types";
+import type { WorkflowQueueDashboard, WorkflowQueueItem, WorkflowRun, WorkflowRunContextAudits } from "../types";
 import type { Translator } from "../i18n";
 
 type DiagnosticsStageProps = {
@@ -6,8 +6,14 @@ type DiagnosticsStageProps = {
   queueDashboard: WorkflowQueueDashboard | null;
   queueLoading: boolean;
   queueError: string;
+  selectedRun: WorkflowRun | null;
+  runContextAudits: WorkflowRunContextAudits | null;
+  contextAuditsLoading: boolean;
+  contextAuditError: string;
   queueItemNote: (item: WorkflowQueueItem) => string;
   queueModeLabel: (mode: WorkflowQueueItem["mode"]) => string;
+  backendLabel: (backend: WorkflowRun["steps"][number]["backend"]) => string;
+  formatDateTime: (value: string) => string;
   embedded?: boolean;
 };
 
@@ -16,16 +22,28 @@ export function DiagnosticsStage({
   queueDashboard,
   queueLoading,
   queueError,
+  selectedRun,
+  runContextAudits,
+  contextAuditsLoading,
+  contextAuditError,
   queueItemNote,
   queueModeLabel,
+  backendLabel,
+  formatDateTime,
   embedded = false,
 }: DiagnosticsStageProps) {
   const queueItems = queueDashboard?.items ?? [];
   const queueWorkers = queueDashboard?.workers ?? [];
+  const contextAudits = runContextAudits?.audits ?? [];
+  const hiddenTerminalCount = queueDashboard?.hidden_terminal_count ?? 0;
+  const hiddenWorkerCount = queueDashboard?.hidden_worker_count ?? 0;
   const runningWorkers = queueWorkers.filter((worker) => worker.status === "running");
   const idleWorkers = queueWorkers.filter((worker) => worker.status === "idle");
   const staleWorkers = queueWorkers.filter((worker) => worker.status === "stale");
   const healthyWorkers = queueWorkers.filter((worker) => worker.status !== "stale");
+  const displayedQueueCount = queueItems.length + hiddenTerminalCount;
+  const displayedWorkerCount = queueWorkers.length + hiddenWorkerCount;
+  const idleWorkerTotal = idleWorkers.length + hiddenWorkerCount;
 
   const content = (
     <>
@@ -41,16 +59,17 @@ export function DiagnosticsStage({
         <article className="glass-panel">
           <div className="panel-header">
             <h3>{t("diagnostics.workers")}</h3>
-            <span>{queueLoading ? t("common.loading") : queueWorkers.length}</span>
+            <span>{queueLoading ? t("common.loading") : displayedWorkerCount}</span>
           </div>
           <p className="workflow-copy">
             {t("diagnostics.workerSummary", {
-              total: queueWorkers.length,
+              total: displayedWorkerCount,
               running: runningWorkers.length,
-              idle: idleWorkers.length,
+              idle: idleWorkerTotal,
               stale: staleWorkers.length,
             })}
           </p>
+          {hiddenWorkerCount > 0 ? <p className="workflow-copy">{t("diagnostics.hiddenWorkers", { count: hiddenWorkerCount })}</p> : null}
           {queueWorkers.length === 0 ? (
             <div className="empty-state">{t("diagnostics.workersEmpty")}</div>
           ) : staleWorkers.length === 0 ? (
@@ -99,7 +118,7 @@ export function DiagnosticsStage({
         <article className="glass-panel">
           <div className="panel-header">
             <h3>{t("diagnostics.queue")}</h3>
-            <span>{queueLoading ? t("common.loading") : queueItems.length}</span>
+            <span>{queueLoading ? t("common.loading") : displayedQueueCount}</span>
           </div>
           <p className="workflow-copy">
             {t("diagnostics.queueSummary", {
@@ -108,6 +127,7 @@ export function DiagnosticsStage({
               terminal: queueDashboard?.terminal_count ?? 0,
             })}
           </p>
+          {hiddenTerminalCount > 0 ? <p className="workflow-copy">{t("diagnostics.hiddenQueueItems", { count: hiddenTerminalCount })}</p> : null}
           <div className="step-list compact-list">
             {queueItems.length === 0 ? (
               <div className="empty-state">{t("diagnostics.queueEmpty")}</div>
@@ -140,6 +160,77 @@ export function DiagnosticsStage({
             )}
           </div>
           {queueError ? <div className="inline-error">{queueError}</div> : null}
+        </article>
+
+        <article className="glass-panel">
+          <div className="panel-header">
+            <h3>{t("diagnostics.contextAudits")}</h3>
+            <span>{contextAuditsLoading ? t("common.loading") : contextAudits.length}</span>
+          </div>
+          <p className="workflow-copy">
+            {selectedRun
+              ? t("diagnostics.contextAuditSummary", {
+                  total: contextAudits.length,
+                  bytes: runContextAudits?.total_input_bytes ?? 0,
+                  forbidden: runContextAudits?.total_forbidden_source_attempts ?? 0,
+                  inputTokens: runContextAudits?.total_input_tokens ?? 0,
+                  cachedTokens: runContextAudits?.total_cached_tokens ?? 0,
+                  outputTokens: runContextAudits?.total_output_tokens ?? 0,
+                })
+              : t("diagnostics.contextAuditEmptySelection")}
+          </p>
+          {!selectedRun ? (
+            <div className="empty-state">{t("diagnostics.contextAuditEmptySelection")}</div>
+          ) : contextAudits.length === 0 ? (
+            <div className="empty-state">{t("diagnostics.contextAuditEmpty")}</div>
+          ) : (
+            <div className="step-list compact-list">
+              {contextAudits.map((audit) => (
+                <article key={audit.id} className="step-item">
+                  <div className="step-header">
+                    <strong>{audit.step_id}</strong>
+                    <span className={`step-mode ${audit.forbidden_source_attempts > 0 ? "failed" : "completed"}`}>
+                      {backendLabel(audit.backend)}
+                    </span>
+                  </div>
+                  <div className="meta-grid compact">
+                    <div>
+                      <span className="meta-label">{t("diagnostics.contextBytes")}</span>
+                      <strong>{audit.input_bytes}</strong>
+                    </div>
+                    <div>
+                      <span className="meta-label">{t("diagnostics.contextMemoryItems")}</span>
+                      <strong>{audit.memory_item_count}</strong>
+                    </div>
+                    <div>
+                      <span className="meta-label">{t("diagnostics.contextForbidden")}</span>
+                      <strong>{audit.forbidden_source_attempts}</strong>
+                    </div>
+                    <div>
+                      <span className="meta-label">{t("diagnostics.contextInputTokens")}</span>
+                      <strong>{audit.input_tokens ?? t("common.none")}</strong>
+                    </div>
+                    <div>
+                      <span className="meta-label">{t("diagnostics.contextCachedTokens")}</span>
+                      <strong>{audit.cached_tokens ?? t("common.none")}</strong>
+                    </div>
+                    <div>
+                      <span className="meta-label">{t("diagnostics.contextOutputTokens")}</span>
+                      <strong>{audit.output_tokens ?? t("common.none")}</strong>
+                    </div>
+                    <div>
+                      <span className="meta-label">{t("diagnostics.contextUpdatedAt")}</span>
+                      <strong>{formatDateTime(audit.updated_at)}</strong>
+                    </div>
+                  </div>
+                  <p className="workflow-copy">
+                    {audit.input_sources.map((source) => `${source.key} (${source.bytes})`).join(" | ")}
+                  </p>
+                </article>
+              ))}
+            </div>
+          )}
+          {contextAuditError ? <div className="inline-error">{contextAuditError}</div> : null}
         </article>
       </div>
     </>

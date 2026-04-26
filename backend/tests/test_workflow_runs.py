@@ -12,11 +12,17 @@ from fastapi import HTTPException
 from app.models.dto import CodexCommandSpec, CodexSessionBridgeResponse, CodexSessionSummary, MemoryEntry, WorkflowRunCreateRequest
 from app.services import workflow_run_execution as execution_service
 from app.services import workflow_backend_codex_delegate as delegate_service
+from app.services import workflow_backend_runtime as runtime_service
+from app.services import workflow_run_steps as step_service
 from app.services.workflow_agent_sessions import append_agent_session_event, finish_agent_session, start_agent_session
+from app.services.workflow_context_audit import create_context_audit, set_active_context_audit
 from app.services.workflow_backend_planner import execute_planner_backend, planning_brief_path
 from app.services.workflow_control_db import connect_control_db
 from app.services.workflow_backend_research import execute_research_backend, project_snapshot_path
+from app.services.workflow_backend_reporter import execute_reporter_backend
+from app.services.workflow_backend_reviewer import execute_reviewer_backend
 from app.services.workflow_backend_verify import execute_verify_backend, verification_brief_path
+from app.services.workflow_artifact_paths import final_state_path, research_result_path, review_result_path, verify_summary_path
 from app.services.workflow_memory import global_memory_path, project_memory_path
 from app.services.workflow_run_queue import complete_workflow_queue_item, enqueue_workflow_run, read_workflow_queue, workflow_queue_path
 from app.services.workflow_run_steps import WorkflowCancellationRequested
@@ -32,6 +38,7 @@ from app.services.workflow_runs import (
     list_agent_sessions,
     list_workflow_runs,
     read_workflow_run_artifacts,
+    read_workflow_run_context_audits,
     read_workflow_run_log,
     resume_workflow_run_now,
     retry_workflow_run_now,
@@ -511,6 +518,71 @@ def test_queue_dashboard_requeues_expired_items_and_marks_stale_workers(test_set
     assert stale_worker.stale_reason
 
 
+def test_queue_dashboard_hides_older_terminal_items_and_idle_workers(test_settings, tmp_path: Path) -> None:
+    project_path = tmp_path / "repo"
+    project_path.mkdir()
+
+    for index in range(10):
+        record = create_workflow_run(
+            WorkflowRunCreateRequest(
+                task=f"Queue dashboard compaction task {index}.",
+                project_path=str(project_path),
+            ),
+            test_settings,
+        )
+        queue_item = enqueue_workflow_run(
+            run_id=record.id,
+            project_path=str(project_path),
+            mode="start",
+            prepared=True,
+            settings=test_settings,
+        )
+        complete_workflow_queue_item(item_id=queue_item["id"], status="completed", settings=test_settings)
+
+    connection = connect_control_db(test_settings)
+    try:
+        heartbeat = now_iso()
+        for index in range(6):
+            connection.execute(
+                """
+                INSERT OR REPLACE INTO workflow_workers (
+                    worker_id,
+                    thread_name,
+                    process_id,
+                    host,
+                    status,
+                    started_at,
+                    last_heartbeat_at,
+                    current_item_id,
+                    current_run_id,
+                    stale_reason
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    f"idle-worker-{index}",
+                    f"workflow-queue-worker-{index}",
+                    100 + index,
+                    "localhost",
+                    "idle",
+                    heartbeat,
+                    heartbeat,
+                    None,
+                    None,
+                    None,
+                ),
+            )
+    finally:
+        connection.close()
+
+    dashboard = get_workflow_queue_dashboard(test_settings)
+    idle_workers = [worker for worker in dashboard.workers if worker.status == "idle"]
+
+    assert dashboard.terminal_count == 10
+    assert dashboard.hidden_terminal_count == 2
+    assert len(idle_workers) == 4
+    assert dashboard.hidden_worker_count == 2
+
+
 def test_workflow_run_executes_to_completion(monkeypatch, test_settings, tmp_path: Path) -> None:
     project_path = tmp_path / "repo"
     project_path.mkdir()
@@ -762,7 +834,7 @@ def test_parallel_verify_branches_can_be_claimed_by_different_workers(monkeypatc
     _approve_run(record, test_settings)
     started = start_workflow_run(record.id, str(project_path), test_settings)
     assert started.status == "running"
-    completed = _wait_for_terminal(record, test_settings, timeout=5)
+    completed = _wait_for_terminal(record, test_settings, timeout=12)
     assert completed.status == "completed"
 
     sessions = list_agent_sessions(completed.id, test_settings)
@@ -885,7 +957,7 @@ def test_running_run_can_be_cancelled(monkeypatch, test_settings, tmp_path: Path
     _approve_run(record, test_settings)
     started = start_workflow_run(record.id, str(project_path), test_settings)
     assert started.status == "running"
-    assert implement_started.wait(timeout=2)
+    assert implement_started.wait(timeout=5)
 
     cancel_result = cancel_workflow_run(record.id, str(project_path), test_settings)
     assert cancel_result.cancel_requested_at is not None
@@ -917,15 +989,67 @@ def test_workflow_run_artifacts_bundle_supports_cockpit_review(monkeypatch, test
         if step_run.step_id == "research":
             snapshot_path = Path(record.run_path) / "project-snapshot.md"
             snapshot_path.write_text("# Project Snapshot\n\n- README.md\n", encoding="utf-8")
+            research_result_path(record).parent.mkdir(parents=True, exist_ok=True)
+            research_result_path(record).write_text(
+                json.dumps(
+                    {
+                        "run_id": record.id,
+                        "task": record.task,
+                        "project_root": record.project_path,
+                        "top_level_entries": ["README.md"],
+                        "relevant_hotspots": ["README.md"],
+                        "continuity_notes": [],
+                        "suggested_next_attention_areas": ["Inspect README.md first."],
+                        "summary": "Captured a fake project snapshot.",
+                    },
+                    indent=2,
+                ),
+                encoding="utf-8",
+            )
             return "Captured a fake project snapshot."
         if step_run.step_id == "implement":
             Path(record.last_message_path).write_text("Implemented the cockpit artifacts and summarized the run.", encoding="utf-8")
             return "Executed a fake Codex implementation step."
         if step_run.step_id == "verify":
             Path(record.run_path, "verification-brief.md").write_text("# Verification Brief\n\nDelegated verify output.\n", encoding="utf-8")
+            verify_summary_path(record).parent.mkdir(parents=True, exist_ok=True)
+            verify_summary_path(record).write_text(
+                json.dumps(
+                    {
+                        "run_id": record.id,
+                        "step_id": step_run.step_id,
+                        "task": record.task,
+                        "executed_commands": [],
+                        "result_summary": "Captured a fake verification summary.",
+                        "validation_risks": [],
+                        "follow_up_checks": [],
+                        "summary": "Captured a fake verification summary.",
+                    },
+                    indent=2,
+                ),
+                encoding="utf-8",
+            )
             return "Captured a fake verification summary."
         if step_run.step_id == "review":
             Path(record.changes_path).write_text("# Changes\n\n- frontend/src/App.tsx\n", encoding="utf-8")
+            review_result_path(record).parent.mkdir(parents=True, exist_ok=True)
+            review_result_path(record).write_text(
+                json.dumps(
+                    {
+                        "run_id": record.id,
+                        "task": record.task,
+                        "reviewer_memory_cross_checks": [],
+                        "changed_files": ["frontend/src/App.tsx"],
+                        "risk_assessment": [],
+                        "open_questions": [],
+                        "git_status_excerpt": "M frontend/src/App.tsx",
+                        "diff_stat_excerpt": "1 file changed",
+                        "summary": "Captured a fake review summary.",
+                    },
+                    indent=2,
+                ),
+                encoding="utf-8",
+            )
             return "Captured a fake review summary."
         if step_run.step_id == "report":
             return "Wrote a fake report."
@@ -961,6 +1085,14 @@ def test_workflow_run_artifacts_bundle_supports_cockpit_review(monkeypatch, test
     assert documents["verification_brief"].available is True
     assert "Verification Brief" in documents["verification_brief"].content
     assert documents["parallel_branches"].available is True
+    assert documents["research_result"].available is True
+    assert '"summary": "Captured a fake project snapshot."' in documents["research_result"].content
+    assert documents["verify_summary"].available is True
+    assert "fake verification summary" in documents["verify_summary"].content
+    assert documents["review_result"].available is True
+    assert "frontend/src/App.tsx" in documents["review_result"].content
+    assert documents["final_state"].available is True
+    assert executed.id in documents["final_state"].content
 
 
 def test_parallel_branch_summary_artifact_captures_parallel_steps(monkeypatch, test_settings, tmp_path: Path) -> None:
@@ -1095,7 +1227,7 @@ def test_workflow_memory_is_recalled_and_written_back(monkeypatch, test_settings
     assert "Written Global Memory" in documents["memory_context"].content
 
 
-def test_high_signal_step_findings_promote_reusable_global_rules(monkeypatch, test_settings, tmp_path: Path) -> None:
+def test_step_findings_no_longer_auto_promote_global_rules(monkeypatch, test_settings, tmp_path: Path) -> None:
     project_path = tmp_path / "repo"
     project_path.mkdir()
     _patch_final_reporter(monkeypatch)
@@ -1129,17 +1261,13 @@ def test_high_signal_step_findings_promote_reusable_global_rules(monkeypatch, te
 
     _approve_run(record, test_settings)
     executed = execute_workflow_run_now(record.id, str(project_path), test_settings)
-    promoted_rules = [entry for entry in executed.memory_context.written_global if entry.entry_kind == "global_rule"]
-    assert len(promoted_rules) == 2
-    assert all(entry.source_step_id in {"research", "verify"} for entry in promoted_rules)
-
     global_entries = json.loads(global_memory_path(test_settings).read_text(encoding="utf-8"))
-    assert any(entry["entry_kind"] == "global_rule" for entry in global_entries)
+    assert not any(entry["entry_kind"] == "global_rule" for entry in global_entries)
 
     artifacts = read_workflow_run_artifacts(executed.id, str(project_path), test_settings)
     documents = {document.key: document for document in artifacts.documents}
     assert "Promoted Global Rules" in documents["report"].content
-    assert "global_rule" in documents["memory_context"].content
+    assert "No reusable global rule" in documents["report"].content
 
 
 def test_planner_backend_can_delegate_to_codex(monkeypatch, test_settings, tmp_path: Path) -> None:
@@ -1158,6 +1286,10 @@ def test_planner_backend_can_delegate_to_codex(monkeypatch, test_settings, tmp_p
         codex_cli_available = True
 
     def fake_run(argv, **kwargs):  # noqa: ANN001
+        cwd = Path(kwargs["cwd"])
+        assert cwd != project_path
+        assert not (cwd / ".agents-team").exists()
+        assert (cwd / ".agents-context" / "project-summary.json").exists()
         artifact_path = Path(argv[argv.index("-o") + 1])
         artifact_path.write_text("# Planning Brief\n\nDelegated planner output.\n", encoding="utf-8")
         return subprocess.CompletedProcess(argv, 0, "", "")
@@ -1193,8 +1325,27 @@ def test_research_backend_can_delegate_to_codex(monkeypatch, test_settings, tmp_
         codex_cli_available = True
 
     def fake_run(argv, **kwargs):  # noqa: ANN001
+        cwd = Path(kwargs["cwd"])
+        assert cwd != project_path
+        assert not (cwd / ".agents-team").exists()
+        assert (cwd / ".agents-context" / "repo-snapshot.json").exists()
         artifact_path = Path(argv[argv.index("-o") + 1])
-        artifact_path.write_text("# Project Snapshot\n\nDelegated research output.\n", encoding="utf-8")
+        artifact_path.write_text(
+            json.dumps(
+                {
+                    "run_id": record.id,
+                    "task": record.task,
+                    "project_root": str(project_path),
+                    "top_level_entries": ["README.md", "src/"],
+                    "relevant_hotspots": ["src/"],
+                    "continuity_notes": ["Remember previous API drift."],
+                    "suggested_next_attention_areas": ["Inspect src/ before editing."],
+                    "summary": "Delegated research output.",
+                },
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
         return subprocess.CompletedProcess(argv, 0, "", "")
 
     monkeypatch.setattr(delegate_service, "get_codex_capabilities", lambda settings: _Capabilities())
@@ -1208,8 +1359,10 @@ def test_research_backend_can_delegate_to_codex(monkeypatch, test_settings, tmp_
     )
 
     assert "delegated to Codex" in summary
+    assert research_result_path(record).exists()
     assert project_snapshot_path(record).exists()
-    assert "Delegated research output" in project_snapshot_path(record).read_text(encoding="utf-8")
+    assert "Relevant Hotspots" in project_snapshot_path(record).read_text(encoding="utf-8")
+    assert "Remember previous API drift." in project_snapshot_path(record).read_text(encoding="utf-8")
 
 
 def test_verify_backend_can_delegate_to_codex(monkeypatch, test_settings, tmp_path: Path) -> None:
@@ -1228,8 +1381,34 @@ def test_verify_backend_can_delegate_to_codex(monkeypatch, test_settings, tmp_pa
         codex_cli_available = True
 
     def fake_run(argv, **kwargs):  # noqa: ANN001
+        cwd = Path(kwargs["cwd"])
+        assert cwd != project_path
+        assert not (cwd / ".agents-team").exists()
+        assert (cwd / ".agents-context" / "changed.diff").exists()
         artifact_path = Path(argv[argv.index("-o") + 1])
-        artifact_path.write_text("# Verification Brief\n\nDelegated verify output.\n", encoding="utf-8")
+        artifact_path.write_text(
+            json.dumps(
+                {
+                    "run_id": record.id,
+                    "step_id": next(step.step_id for step in record.step_runs if step.step_id.startswith("verify")),
+                    "task": record.task,
+                    "executed_commands": [
+                        {
+                            "label": "python -m pytest",
+                            "status": "completed",
+                            "exit_code": 0,
+                            "output_excerpt": "all green",
+                        }
+                    ],
+                    "result_summary": "Delegated verify output.",
+                    "validation_risks": [],
+                    "follow_up_checks": ["Re-run the most relevant checks after edits."],
+                    "summary": "Delegated verify output.",
+                },
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
         return subprocess.CompletedProcess(argv, 0, "", "")
 
     monkeypatch.setattr(delegate_service, "get_codex_capabilities", lambda settings: _Capabilities())
@@ -1244,5 +1423,420 @@ def test_verify_backend_can_delegate_to_codex(monkeypatch, test_settings, tmp_pa
     )
 
     assert "delegated to Codex" in summary
+    assert verify_summary_path(record).exists()
     assert verification_brief_path(record).exists()
     assert "Delegated verify output" in verification_brief_path(record).read_text(encoding="utf-8")
+
+
+def test_reviewer_backend_can_delegate_to_codex(monkeypatch, test_settings, tmp_path: Path) -> None:
+    project_path = tmp_path / "repo"
+    project_path.mkdir()
+
+    record = create_workflow_run(
+        WorkflowRunCreateRequest(
+            task="Review a delegated backend workflow for this repository.",
+            project_path=str(project_path),
+        ),
+        test_settings,
+    )
+
+    class _Capabilities:
+        codex_cli_available = True
+
+    def fake_run(argv, **kwargs):  # noqa: ANN001
+        cwd = Path(kwargs["cwd"])
+        assert cwd != project_path
+        assert (cwd / ".agents-context" / "verify-summary.json").exists()
+        artifact_path = Path(argv[argv.index("-o") + 1])
+        artifact_path.write_text(
+            json.dumps(
+                {
+                    "run_id": record.id,
+                    "task": record.task,
+                    "reviewer_memory_cross_checks": ["Check the latest verification result."],
+                    "changed_files": ["backend/app/services/workflow_backend_reviewer.py"],
+                    "risk_assessment": ["No blocking risks found."],
+                    "open_questions": [],
+                    "git_status_excerpt": "M backend/app/services/workflow_backend_reviewer.py",
+                    "diff_stat_excerpt": "1 file changed",
+                    "summary": "Delegated reviewer output.",
+                },
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
+        return subprocess.CompletedProcess(argv, 0, "", "")
+
+    monkeypatch.setattr(delegate_service, "get_codex_capabilities", lambda settings: _Capabilities())
+    monkeypatch.setattr(delegate_service, "_run_delegated_command", fake_run)
+
+    summary = execute_reviewer_backend(
+        record,
+        test_settings,
+        should_cancel=lambda: False,
+        set_active_process=lambda process: None,  # noqa: ARG005
+    )
+
+    assert "delegated to Codex" in summary
+    assert review_result_path(record).exists()
+    assert "workflow_backend_reviewer.py" in Path(record.changes_path).read_text(encoding="utf-8")
+
+
+def test_reporter_backend_persists_final_state_contract(monkeypatch, test_settings, tmp_path: Path) -> None:
+    project_path = tmp_path / "repo"
+    project_path.mkdir()
+
+    record = create_workflow_run(
+        WorkflowRunCreateRequest(
+            task="Report a delegated backend workflow for this repository.",
+            project_path=str(project_path),
+        ),
+        test_settings,
+    )
+    Path(record.last_message_path).write_text("Implemented in a previous step.\n", encoding="utf-8")
+    Path(record.changes_path).write_text("# Changes\n\n- backend/app/services/workflow_backend_reporter.py\n", encoding="utf-8")
+    for step_run in record.step_runs:
+        if step_run.step_id != "report":
+            step_run.status = "completed"
+            step_run.summary = f"Completed {step_run.step_id}."
+    save_record(record, test_settings)
+
+    class _Capabilities:
+        codex_cli_available = True
+
+    def fake_run(argv, **kwargs):  # noqa: ANN001
+        cwd = Path(kwargs["cwd"])
+        assert cwd != project_path
+        assert (cwd / ".agents-context" / "final-state.json").exists()
+        artifact_path = Path(argv[argv.index("-o") + 1])
+        artifact_path.write_text("# Final Report\n\nDelegated reporter output.\n", encoding="utf-8")
+        return subprocess.CompletedProcess(argv, 0, "", "")
+
+    monkeypatch.setattr(delegate_service, "get_codex_capabilities", lambda settings: _Capabilities())
+    monkeypatch.setattr(delegate_service, "_run_delegated_command", fake_run)
+
+    summary = execute_reporter_backend(
+        record,
+        test_settings,
+        should_cancel=lambda: False,
+        set_active_process=lambda process: None,  # noqa: ARG005
+    )
+
+    assert "delegated to Codex" in summary
+    assert final_state_path(record).exists()
+    final_state = json.loads(final_state_path(record).read_text(encoding="utf-8"))
+    assert final_state["run_id"] == record.id
+    assert Path(record.report_path).read_text(encoding="utf-8").startswith("# Final Report")
+
+
+def test_implement_step_uses_projected_workspace_and_records_context_audit(monkeypatch, test_settings, tmp_path: Path) -> None:
+    project_path = tmp_path / "repo"
+    project_path.mkdir()
+    (project_path / "app.py").write_text("print('before')\n", encoding="utf-8")
+
+    record = create_workflow_run(
+        WorkflowRunCreateRequest(
+            task="Implement a projected-workspace change without exposing runtime state.",
+            project_path=str(project_path),
+        ),
+        test_settings,
+    )
+    implement_step = next(step for step in record.step_runs if step.step_id == "implement")
+
+    class _Capabilities:
+        codex_cli_available = True
+
+    def fake_run_command(argv, **kwargs):  # noqa: ANN001
+        cwd = Path(kwargs["cwd"])
+        assert cwd != project_path
+        assert not (cwd / ".agents-team").exists()
+        assert (cwd / ".agents-context" / "step-context.json").exists()
+        assert (cwd / ".agents-context" / "selected-memory.json").exists()
+        (cwd / "app.py").write_text("print('after')\n", encoding="utf-8")
+        (cwd / "implemented.txt").write_text("done\n", encoding="utf-8")
+        artifact_path = Path(argv[argv.index("-o") + 1])
+        artifact_path.write_text("Implemented through the isolated workspace.\n", encoding="utf-8")
+        return subprocess.CompletedProcess(argv, 0, "", "")
+
+    monkeypatch.setattr(step_service, "get_codex_capabilities", lambda settings: _Capabilities())
+    monkeypatch.setattr(step_service, "run_command", fake_run_command)
+
+    summary = step_service.execute_codex_step(
+        record,
+        implement_step,
+        test_settings,
+        should_cancel=lambda: False,
+        set_active_process=lambda process: None,  # noqa: ARG005
+    )
+
+    assert "isolated context workspace" in summary
+    assert (project_path / "implemented.txt").exists()
+    assert (project_path / "app.py").read_text(encoding="utf-8") == "print('after')\n"
+    assert Path(record.last_message_path).read_text(encoding="utf-8") == "Implemented through the isolated workspace.\n"
+
+    connection = connect_control_db(test_settings)
+    try:
+        row = connection.execute(
+            """
+            SELECT step_id, input_bytes, memory_item_count, raw_log_bytes_included, markdown_artifact_bytes_included
+            FROM workflow_context_audits
+            WHERE run_id = ?
+            ORDER BY created_at DESC
+            LIMIT 1
+            """,
+            (record.id,),
+        ).fetchone()
+    finally:
+        connection.close()
+
+    assert row is not None
+    assert row["step_id"] == "implement"
+    assert row["input_bytes"] > 0
+    assert row["memory_item_count"] <= 3
+    assert row["raw_log_bytes_included"] == 0
+    assert row["markdown_artifact_bytes_included"] == 0
+
+    audits = read_workflow_run_context_audits(record.id, test_settings)
+    assert audits.run_id == record.id
+    assert audits.total_input_bytes >= row["input_bytes"]
+    assert audits.audits[0].step_id == "implement"
+
+
+def test_codex_usage_events_update_context_audit_token_totals(test_settings, tmp_path: Path) -> None:
+    project_path = tmp_path / "repo"
+    project_path.mkdir()
+
+    record = create_workflow_run(
+        WorkflowRunCreateRequest(
+            task="Capture token usage from Codex JSON events.",
+            project_path=str(project_path),
+        ),
+        test_settings,
+    )
+    step_run = next(step for step in record.step_runs if step.step_id == "implement")
+    audit_id = create_context_audit(
+        record=record,
+        step_run=step_run,
+        settings=test_settings,
+        workspace_path=str(project_path),
+        input_sources=[{"key": "step_context", "path": ".agents-context/step-context.json", "bytes": 128}],
+        input_bytes=128,
+        memory_item_count=2,
+        raw_log_bytes_included=0,
+        markdown_artifact_bytes_included=0,
+    )
+
+    set_active_context_audit(audit_id)
+    try:
+        runtime_service._capture_codex_stream_event(
+            test_settings,
+            record,
+            json.dumps(
+                {
+                    "type": "turn.completed",
+                    "usage": {
+                        "input_tokens": 22382,
+                        "cached_input_tokens": 21376,
+                        "output_tokens": 2366,
+                    },
+                }
+            ),
+        )
+    finally:
+        set_active_context_audit(None)
+
+    audits = read_workflow_run_context_audits(record.id, test_settings)
+    assert audits.total_input_tokens == 22382
+    assert audits.total_cached_tokens == 21376
+    assert audits.total_output_tokens == 2366
+    assert audits.audits[0].input_tokens == 22382
+    assert audits.audits[0].cached_tokens == 21376
+    assert audits.audits[0].output_tokens == 2366
+
+
+def test_research_can_short_circuit_duplicate_runs(monkeypatch, test_settings, tmp_path: Path) -> None:
+    project_path = tmp_path / "repo"
+    project_path.mkdir()
+    (project_path / "README.md").write_text("# Demo\n", encoding="utf-8")
+    _patch_final_reporter(monkeypatch)
+
+    previous = create_workflow_run(
+        WorkflowRunCreateRequest(
+            task="Add help support to calculator.py without changing calculator behavior.",
+            project_path=str(project_path),
+        ),
+        test_settings,
+    )
+    previous.status = "completed"
+    previous.started_at = now_iso()
+    previous.completed_at = now_iso()
+    previous.summary = "Previous successful run."
+    save_record(previous, test_settings)
+
+    record = create_workflow_run(
+        WorkflowRunCreateRequest(
+            task="Add help support to calculator.py without changing calculator behavior.",
+            project_path=str(project_path),
+        ),
+        test_settings,
+    )
+
+    def fake_execute_step(record, step_run, settings, should_cancel, set_active_process):  # noqa: ARG001
+        if step_run.step_id == "research":
+            research_result_path(record).parent.mkdir(parents=True, exist_ok=True)
+            research_result_path(record).write_text(
+                json.dumps(
+                    {
+                        "decision": "stop_as_duplicate",
+                        "matched_run_id": previous.id,
+                        "confidence": 0.97,
+                        "reason": "A previous successful run already completed the same task and the repository has not changed.",
+                        "delta_hint": "",
+                        "run_id": record.id,
+                        "task": record.task,
+                        "project_root": record.project_path,
+                        "top_level_entries": ["README.md"],
+                        "relevant_hotspots": ["README.md"],
+                        "continuity_notes": [],
+                        "suggested_next_attention_areas": [],
+                        "summary": f"Research matched this task to `{previous.id}` and recommends stopping as a duplicate.",
+                    },
+                    indent=2,
+                ),
+                encoding="utf-8",
+            )
+            return f"Research matched this task to `{previous.id}` and recommends stopping as a duplicate."
+        if step_run.step_id == "implement":
+            raise AssertionError("implement should not run after research short-circuits the workflow")
+        if step_run.step_id.startswith("verify"):
+            raise AssertionError("verify should not run after research short-circuits the workflow")
+        if step_run.step_id == "review":
+            raise AssertionError("review should not run after research short-circuits the workflow")
+        if step_run.step_id == "report":
+            return "Report completed."
+        return f"Completed step {step_run.step_id}."
+
+    monkeypatch.setattr(execution_service, "execute_step", fake_execute_step)
+
+    _approve_run(record, test_settings)
+    executed = execute_workflow_run_now(record.id, str(project_path), test_settings)
+
+    assert executed.status == "short_circuited"
+    assert executed.reuse_decision == "stop_as_duplicate"
+    assert executed.matched_run_id == previous.id
+    assert executed.reuse_reason
+    assert any(step.step_id == "implement" and step.status == "skipped" for step in executed.step_runs)
+    assert any(step.step_id == "verify" and step.status == "skipped" for step in executed.step_runs)
+    assert any(step.step_id == "review" and step.status == "skipped" for step in executed.step_runs)
+    assert any(step.step_id == "report" and step.status == "completed" for step in executed.step_runs)
+    assert previous.id in Path(executed.report_path).read_text(encoding="utf-8")
+
+
+def test_research_can_narrow_workflow_to_delta(monkeypatch, test_settings, tmp_path: Path) -> None:
+    project_path = tmp_path / "repo"
+    project_path.mkdir()
+    (project_path / "README.md").write_text("# Demo\n", encoding="utf-8")
+    (project_path / "tests").mkdir()
+    (project_path / "package.json").write_text(
+        json.dumps(
+            {
+                "scripts": {
+                    "build": "vite build",
+                    "test": "vitest run",
+                }
+            },
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+    _patch_final_reporter(monkeypatch)
+
+    previous = create_workflow_run(
+        WorkflowRunCreateRequest(
+            task="Add help support to calculator.py without changing calculator behavior.",
+            project_path=str(project_path),
+        ),
+        test_settings,
+    )
+    previous.status = "completed"
+    previous.started_at = now_iso()
+    previous.completed_at = now_iso()
+    previous.summary = "Previous successful run."
+    save_record(previous, test_settings)
+
+    record = create_workflow_run(
+        WorkflowRunCreateRequest(
+            task="Add help support to calculator.py and update the surrounding documentation if needed.",
+            project_path=str(project_path),
+        ),
+        test_settings,
+    )
+    implemented_goals: list[str] = []
+
+    def fake_execute_step(record, step_run, settings, should_cancel, set_active_process):  # noqa: ARG001
+        if step_run.step_id == "research":
+            research_result_path(record).parent.mkdir(parents=True, exist_ok=True)
+            research_result_path(record).write_text(
+                json.dumps(
+                    {
+                        "decision": "continue_with_delta",
+                        "matched_run_id": previous.id,
+                        "confidence": 0.84,
+                        "reason": "A recent similar successful run exists, but surrounding files changed and only a small delta remains.",
+                        "delta_hint": "Focus only on calculator help text and any directly related docs.",
+                        "delta_scope": {
+                            "focus_paths": ["README.md"],
+                            "matched_run_changed_files": ["README.md"],
+                            "current_diff_files": ["README.md"],
+                            "verification_focus": "docs",
+                            "scope_summary": "Keep verification lightweight and limit it to the documentation-facing delta.",
+                        },
+                        "run_id": record.id,
+                        "task": record.task,
+                        "project_root": record.project_path,
+                        "top_level_entries": ["README.md"],
+                        "relevant_hotspots": ["README.md"],
+                        "continuity_notes": [],
+                        "suggested_next_attention_areas": [],
+                        "summary": "Research found that most prior work still applies and suggests continuing with a narrowed delta.",
+                    },
+                    indent=2,
+                ),
+                encoding="utf-8",
+            )
+            return "Research found that most prior work still applies and suggests continuing with a narrowed delta."
+        if step_run.step_id == "implement":
+            implemented_goals.append(step_run.goal)
+            Path(record.last_message_path).write_text("Implemented only the remaining delta.\n", encoding="utf-8")
+            return "Implemented only the remaining delta."
+        if step_run.step_id.startswith("verify"):
+            assert not step_run.command_previews
+            assert "delta" in step_run.goal.lower() or "remaining" in step_run.goal.lower()
+            return f"Completed {step_run.step_id} for the narrowed delta."
+        if step_run.step_id == "review":
+            assert "delta" in step_run.goal.lower() or "matched prior run" in step_run.goal.lower()
+            Path(record.changes_path).write_text("# Changes\n\n- README.md\n", encoding="utf-8")
+            return "Reviewed the narrowed delta."
+        if step_run.step_id == "report":
+            return "Reported the narrowed delta."
+        return f"Completed step {step_run.step_id}."
+
+    monkeypatch.setattr(execution_service, "execute_step", fake_execute_step)
+
+    _approve_run(record, test_settings)
+    executed = execute_workflow_run_now(record.id, str(project_path), test_settings)
+
+    assert executed.status == "completed"
+    assert executed.reuse_decision == "continue_with_delta"
+    assert executed.matched_run_id == previous.id
+    assert executed.delta_hint == "Focus only on calculator help text and any directly related docs."
+    assert executed.delta_scope is not None
+    assert executed.delta_scope.verification_focus == "docs"
+    assert implemented_goals
+    assert any("remaining delta" in goal.lower() or "matched prior run" in goal.lower() for goal in implemented_goals)
+    verify_step = next(step for step in executed.step_runs if step.step_id == "verify")
+    assert verify_step.command_previews == []
+    final_state = json.loads(final_state_path(executed).read_text(encoding="utf-8"))
+    assert final_state["reuse_decision"] == "continue_with_delta"
+    assert final_state["matched_run_id"] == previous.id
+    assert final_state["delta_scope"]["verification_focus"] == "docs"
