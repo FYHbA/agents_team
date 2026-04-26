@@ -164,6 +164,21 @@ def get_workflow_run(run_id: str, project_path_str: str | None, settings: Settin
         connection.close()
 
 
+def delete_workflow_run_record(run_id: str, settings: Settings) -> None:
+    initialize_control_db(settings)
+    connection = connect_control_db(settings)
+    try:
+        connection.execute(
+            """
+            DELETE FROM workflow_runs
+            WHERE id = ?
+            """,
+            (run_id,),
+        )
+    finally:
+        connection.close()
+
+
 def append_log(record: WorkflowRunRecord, message: str) -> None:
     log_path = Path(record.log_path)
     log_path.parent.mkdir(parents=True, exist_ok=True)

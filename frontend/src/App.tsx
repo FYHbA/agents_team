@@ -5,6 +5,7 @@ import {
   cancelWorkflowRun,
   createWorkflowPlan,
   createWorkflowRun,
+  deleteWorkflowRun,
   executeWorkflowRun,
   exportProjectRuntime,
   getCodexSummary,
@@ -93,6 +94,7 @@ export default function App() {
   const { locale, setLocale, t } = useI18n();
 
   const [summary, setSummary] = useState<CodexSummary | null>(null);
+  const [bootstrapping, setBootstrapping] = useState(true);
   const [projects, setProjects] = useState<ProjectRecord[]>([]);
   const [recentProjects, setRecentProjects] = useState<RecentProjectRecord[]>([]);
   const [projectCapabilities, setProjectCapabilities] = useState<ProjectCapabilities | null>(null);
@@ -208,6 +210,8 @@ export default function App() {
         }
       } catch (error) {
         setBootstrapError(error instanceof Error ? error.message : "Failed to load app bootstrap data.");
+      } finally {
+        setBootstrapping(false);
       }
     }
 
@@ -364,8 +368,10 @@ export default function App() {
   useEffect(() => {
     let cancelled = false;
 
-    async function loadAgentSessions(runId: string) {
-      setAgentSessionsLoading(true);
+    async function loadAgentSessions(runId: string, silent = false) {
+      if (!silent) {
+        setAgentSessionsLoading(true);
+      }
       try {
         const result = await getWorkflowAgentSessions(runId);
         if (!cancelled) {
@@ -377,7 +383,7 @@ export default function App() {
           setAgentSessionsError(error instanceof Error ? error.message : "Failed to load agent sessions.");
         }
       } finally {
-        if (!cancelled) {
+        if (!cancelled && !silent) {
           setAgentSessionsLoading(false);
         }
       }
@@ -390,14 +396,24 @@ export default function App() {
     }
 
     void loadAgentSessions(selectedRunId);
+    const timer =
+      selectedRun?.status === "running"
+        ? window.setInterval(() => {
+            void loadAgentSessions(selectedRunId, true);
+          }, 1500)
+        : null;
     return () => {
       cancelled = true;
+      if (timer !== null) {
+        window.clearInterval(timer);
+      }
     };
-  }, [selectedRunId, artifactRefreshToken]);
+  }, [selectedRunId, artifactRefreshToken, selectedRun?.status]);
 
   useEffect(() => {
     setSelectedArtifactKey((currentKey) => {
-      if (runArtifacts?.documents.some((document) => document.key === currentKey)) {
+      const currentDocument = runArtifacts?.documents.find((document) => document.key === currentKey);
+      if (currentDocument?.available) {
         return currentKey;
       }
       return runArtifacts?.documents.find((document) => document.available)?.key ?? "report";
@@ -448,6 +464,7 @@ export default function App() {
     setRuntimeError("");
     setRunError("");
     try {
+      const switchingProjects = projectPath !== selectedProject;
       const [runtimeResultRaw, runsResult, recentResult] = await Promise.all([
         getProjectRuntime(projectPath),
         getWorkflowRuns(projectPath),
@@ -455,6 +472,13 @@ export default function App() {
       ]);
       const runtimeResult =
         runtimeResultRaw.state === "missing" ? await initProjectRuntime(projectPath) : runtimeResultRaw;
+      if (switchingProjects) {
+        setTask("");
+        setPlan(null);
+        setPlanError("");
+        setArtifactError("");
+        setSelectedArtifactKey("report");
+      }
       setSelectedProject(projectPath);
       setManualProjectPath(projectPath);
       setRuntime(runtimeResult);
@@ -622,6 +646,28 @@ export default function App() {
       await loadProjectState(workspace.project_path);
     } catch (error) {
       setRuntimeError(error instanceof Error ? error.message : "Failed to open the project.");
+    }
+  }
+
+  function handleTaskChange(value: string) {
+    setTask(value);
+    setPlanError("");
+    if (plan) {
+      setPlan(null);
+    }
+  }
+
+  function handleAllowNetworkChange(value: boolean) {
+    setAllowNetwork(value);
+    if (plan) {
+      setPlan(null);
+    }
+  }
+
+  function handleAllowInstallsChange(value: boolean) {
+    setAllowInstalls(value);
+    if (plan) {
+      setPlan(null);
     }
   }
 
@@ -876,6 +922,34 @@ export default function App() {
     }
   }
 
+  async function handleDeleteRun(runId: string) {
+    if (!selectedProject) {
+      setRunError(t("project.notSelected"));
+      return;
+    }
+    const deletingSelectedRun = selectedRunId === runId;
+    setRunLoading(true);
+    setRunError("");
+    try {
+      await deleteWorkflowRun(runId, selectedProject);
+      if (deletingSelectedRun) {
+        setSelectedRunId("");
+        setSelectedRun(null);
+        setRunLog("");
+        setRunArtifacts(null);
+        setAgentSessions([]);
+        setArtifactError("");
+        setAgentSessionsError("");
+        setSelectedArtifactKey("report");
+      }
+      await loadProjectState(selectedProject, deletingSelectedRun ? undefined : selectedRunId);
+    } catch (error) {
+      setRunError(error instanceof Error ? error.message : "Failed to delete the workflow run.");
+    } finally {
+      setRunLoading(false);
+    }
+  }
+
   return (
     <div className="shell tech-shell">
       <div className="shell-backdrop" />
@@ -883,7 +957,13 @@ export default function App() {
 
       {bootstrapError ? <div className="banner error">{bootstrapError}</div> : null}
 
-      {activeView === "launcher" || !selectedProject ? (
+      {bootstrapping ? (
+        <section className="stage-panel">
+          <div className="empty-state">{t("common.loading")}</div>
+        </section>
+      ) : null}
+
+      {!bootstrapping && (activeView === "launcher" || !selectedProject) ? (
         <ProjectStage
           t={t}
           projects={projects}
@@ -915,7 +995,7 @@ export default function App() {
         />
       ) : null}
 
-      {activeView === "workspace" && selectedProject ? (
+      {!bootstrapping && activeView === "workspace" && selectedProject ? (
         <WorkspaceStage
           t={t}
           selectedProject={selectedProject}
@@ -953,9 +1033,9 @@ export default function App() {
               backendLabel={backendLabel}
               executionLabel={executionLabel}
               agentRoleLabel={agentRoleLabel}
-              onTaskChange={setTask}
-              onAllowNetworkChange={setAllowNetwork}
-              onAllowInstallsChange={setAllowInstalls}
+              onTaskChange={handleTaskChange}
+              onAllowNetworkChange={handleAllowNetworkChange}
+              onAllowInstallsChange={handleAllowInstallsChange}
               onDraftWorkflow={() => void handleDraftWorkflow()}
               onCreateRun={() => void handleCreateRun()}
             />
@@ -964,6 +1044,7 @@ export default function App() {
             <RunStage
               embedded
               t={t}
+              locale={locale}
               runs={runs}
               selectedRunId={selectedRunId}
               selectedRun={selectedRun}
@@ -985,6 +1066,7 @@ export default function App() {
               onApproveRun={(runId, commandIds) => void handleApproveRun(runId, commandIds)}
               onResumeRun={(runId) => void handleResumeRun(runId)}
               onRetryRun={(runId) => void handleRetryRun(runId)}
+              onDeleteRun={(runId) => void handleDeleteRun(runId)}
               runLoading={runLoading}
               runNeedsDangerousApproval={runNeedsDangerousApproval}
               runStatusNote={runStatusNote}

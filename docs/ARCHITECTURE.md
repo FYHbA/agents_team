@@ -25,6 +25,7 @@ Execution layer
     - queue worker and recovery loop
     - worker ownership, heartbeats, and leases
     - step-scoped agent session tracking
+    - per-session event timelines for thought / command / final-answer rendering
     - dependency-aware workflow graph scheduler
     - separately claimed branch jobs for parallel waves
     - Codex-backed runs
@@ -124,6 +125,7 @@ CLI and service entry points are a safer integration boundary.
 - worker ownership should be explicit and renewed through heartbeats / leases while work is active
 - stale worker leases should be recoverable, with expired queue items requeued and stale workers surfaced in diagnostics
 - each workflow step should be observable as its own agent session, not only as a field on the final run record
+- agent sessions should also be able to expose ordered event timelines so the frontend can render live thinking text, collapsible shell activity, and final answers without reverse-engineering one flat summary string
 - dependency-aware schedulers should be able to emit parallel branch jobs that different workers can claim independently
 - parallel branch waves should emit enough branch-level state and artifacts to explain partial failures after review/report
 - branch failure policy should be explicit: some downstream steps such as review may continue on failed verification branches while the overall run still resolves to failed

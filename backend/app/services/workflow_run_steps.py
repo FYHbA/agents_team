@@ -108,6 +108,7 @@ def execute_codex_step(
     argv, summary_prefix, provider, session_ref = _codex_exec_argv(record, settings)
     completed = run_command(
         argv,
+        settings=settings,
         cwd=record.project_path,
         timeout=RUN_TIMEOUT_SECONDS,
         log_prefix="codex",

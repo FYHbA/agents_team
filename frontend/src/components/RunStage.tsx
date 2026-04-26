@@ -2,10 +2,11 @@ import { useDeferredValue, useEffect, useState } from "react";
 
 import { ArtifactDocumentViewer, extractMarkdownOutline, parseMarkdown } from "./ArtifactDocumentViewer";
 import { TraceLogViewer } from "./TraceLogViewer";
-import type { Translator } from "../i18n";
+import type { Locale, Translator } from "../i18n";
 import type {
   MemoryEntry,
   WorkflowAgentSession,
+  WorkflowAgentSessionEvent,
   WorkflowArtifactDocument,
   WorkflowCommandPreview,
   WorkflowRun,
@@ -22,6 +23,7 @@ type RunGroup = {
 
 type RunStageProps = {
   t: Translator;
+  locale: Locale;
   runs: WorkflowRun[];
   selectedRunId: string;
   selectedRun: WorkflowRun | null;
@@ -40,6 +42,7 @@ type RunStageProps = {
   onApproveRun: (runId: string, commandIds?: string[]) => void;
   onResumeRun: (runId: string) => void;
   onRetryRun: (runId: string) => void;
+  onDeleteRun: (runId: string) => void;
   runLoading: boolean;
   runNeedsDangerousApproval: (run: WorkflowRun | null) => boolean;
   runStatusNote: (run: WorkflowRun) => string | null;
@@ -58,6 +61,7 @@ type RunStageProps = {
 
 type ChatMessage = {
   id: string;
+  stepId: string;
   agentRole: string;
   title: string;
   body: string;
@@ -68,6 +72,12 @@ type ChatMessage = {
   goal: string | null;
   dependsOn: string[];
   commandPreviews: WorkflowCommandPreview[];
+  hasStructuredTimeline: boolean;
+  thinkingMessages: string[];
+  finalMessage: string | null;
+  collapsedPreview: string | null;
+  commandEvents: ChatCommandEvent[];
+  events: WorkflowAgentSessionEvent[];
 };
 
 type ChatActionItem = {
@@ -76,8 +86,26 @@ type ChatActionItem = {
   meta?: string;
 };
 
+type ChatCommandEvent = {
+  id: string;
+  label: string;
+  command: string;
+  status: string;
+  output: string;
+  exitCode: number | null;
+  sequence: number;
+};
+
+type ChatTimeline = {
+  hasStructuredEvents: boolean;
+  thinkingMessages: string[];
+  finalMessage: string | null;
+  commands: ChatCommandEvent[];
+};
+
 export function RunStage({
   t,
+  locale,
   runs,
   selectedRunId,
   selectedRun,
@@ -96,6 +124,7 @@ export function RunStage({
   onApproveRun,
   onResumeRun,
   onRetryRun,
+  onDeleteRun,
   runLoading,
   runNeedsDangerousApproval,
   runStatusNote,
@@ -127,6 +156,16 @@ export function RunStage({
       return value;
     }
     return `${value.slice(0, Math.max(0, maxLength - 3)).trimEnd()}...`;
+  }
+
+  function formatCollapsedPreview(value: string, fallback: string): string {
+    const normalized = value
+      .replace(/\[([^\]]+)\]\([^)]+\)/g, "$1")
+      .replace(/^#+\s*/gm, "")
+      .replace(/`/g, "")
+      .replace(/\s+/g, " ")
+      .trim();
+    return compactText(normalized || fallback, 156);
   }
 
   function avatarLabel(role: string): string {
@@ -234,6 +273,7 @@ export function RunStage({
   const chatMessages: ChatMessage[] =
     agentSessions.length > 0
       ? agentSessions.map((session) => ({
+          stepId: session.step_id,
           goal: stepRunById.get(session.step_id)?.goal ?? null,
           dependsOn: stepRunById.get(session.step_id)?.depends_on ?? [],
           commandPreviews: stepRunById.get(session.step_id)?.command_previews ?? [],
@@ -245,9 +285,24 @@ export function RunStage({
           timestamp: session.completed_at ?? session.started_at,
           backend: session.backend,
           provider: session.provider,
+          hasStructuredTimeline: session.has_structured_timeline,
+          thinkingMessages: session.thinking_messages,
+          finalMessage: session.final_message,
+          collapsedPreview: session.collapsed_preview,
+          commandEvents: session.commands.map((command) => ({
+            id: command.id,
+            label: command.label,
+            command: command.command,
+            status: command.status,
+            output: command.output,
+            exitCode: command.exit_code,
+            sequence: command.sequence,
+          })),
+          events: session.events ?? [],
         }))
       : selectedRun?.step_runs.map((stepRun) => ({
           id: stepRun.step_id,
+          stepId: stepRun.step_id,
           agentRole: stepRun.agent_role,
           title: stepRun.title,
           body: stepRun.summary ?? stepRun.goal ?? t("run.chatPending"),
@@ -258,6 +313,12 @@ export function RunStage({
           goal: stepRun.goal,
           dependsOn: stepRun.depends_on,
           commandPreviews: stepRun.command_previews,
+          hasStructuredTimeline: false,
+          thinkingMessages: [],
+          finalMessage: null,
+          collapsedPreview: null,
+          commandEvents: [],
+          events: [],
         })) ?? [];
 
   function isChatExpanded(message: ChatMessage): boolean {
@@ -273,6 +334,20 @@ export function RunStage({
       [messageId]: !current[messageId],
     }));
   }
+
+  function requestDeleteRun(run: WorkflowRun) {
+    const label = compactText(`${run.team_name} · ${run.task}`, 120);
+    if (!window.confirm(t("run.deleteConfirm", { label }))) {
+      return;
+    }
+    onDeleteRun(run.id);
+  }
+
+  const lifecycleNote = selectedRun
+    ? selectedRun.error
+      ? compactText(selectedRun.error, 140)
+      : runStatusNote(selectedRun) ?? compactText(selectedRun.task, 140)
+    : "";
 
   const content = (
     <>
@@ -390,6 +465,16 @@ export function RunStage({
                                   </button>
                                 </>
                               ) : null}
+                              {run.status !== "running" ? (
+                                <button
+                                  type="button"
+                                  className="secondary-button danger-button"
+                                  onClick={() => requestDeleteRun(run)}
+                                  disabled={runLoading}
+                                >
+                                  {t("run.delete")}
+                                </button>
+                              ) : null}
                             </div>
                           </article>
                         );
@@ -415,9 +500,23 @@ export function RunStage({
                   </div>
                   <p className="workflow-copy">{selectedRun.task}</p>
                 </div>
-                <div className="run-detail-meta">
-                  <span>{selectedRun.id}</span>
-                  <span>{selectedRun.completed_at ? formatDateTime(selectedRun.completed_at) : formatDateTime(selectedRun.created_at)}</span>
+                <div className="run-detail-side">
+                  <div className="run-detail-meta">
+                    <span>{selectedRun.id}</span>
+                    <span>{selectedRun.completed_at ? formatDateTime(selectedRun.completed_at) : formatDateTime(selectedRun.created_at)}</span>
+                  </div>
+                  {selectedRun.status !== "running" ? (
+                    <div className="run-detail-actions">
+                      <button
+                        type="button"
+                        className="secondary-button danger-button"
+                        onClick={() => requestDeleteRun(selectedRun)}
+                        disabled={runLoading}
+                      >
+                        {t("run.delete")}
+                      </button>
+                    </div>
+                  ) : null}
                 </div>
               </div>
 
@@ -440,7 +539,7 @@ export function RunStage({
                     <article className="summary-card">
                       <span className="meta-label">{t("run.lifecycle")}</span>
                       <strong>{statusLabel(selectedRun.status)}</strong>
-                      <p>{compactText(selectedRun.error ?? selectedRun.summary, 140)}</p>
+                      <p>{lifecycleNote}</p>
                     </article>
                     <article className="summary-card">
                       <span className="meta-label">{t("run.stepProgress")}</span>
@@ -450,7 +549,13 @@ export function RunStage({
                     <article className="summary-card">
                       <span className="meta-label">{t("run.artifacts")}</span>
                       <strong>{artifactTarget ? `${artifactCount} / ${artifactTarget}` : t("common.none")}</strong>
-                      <p>{artifactLoading ? t("common.refreshing") : t("run.artifactsHint", { count: artifactCount })}</p>
+                      <p className={artifactError ? "warning-copy" : undefined}>
+                        {artifactError
+                          ? compactText(artifactError, 140)
+                          : artifactLoading
+                          ? t("common.refreshing")
+                          : t("run.artifactsHint", { count: artifactCount })}
+                      </p>
                     </article>
                     <article className="summary-card">
                       <span className="meta-label">{t("run.safety")}</span>
@@ -466,21 +571,17 @@ export function RunStage({
                     <article className="summary-card">
                       <span className="meta-label">{t("run.memoryRecalled")}</span>
                       <strong>{recalledCount}</strong>
-                      <p>{compactText(memorySummary([...selectedRun.memory_context.recalled_project, ...selectedRun.memory_context.recalled_global]))}</p>
+                      <p>{memoryOverviewCopy("recalled", recalledCount, locale, t("common.none"))}</p>
                     </article>
                     <article className="summary-card">
                       <span className="meta-label">{t("run.memoryWritten")}</span>
                       <strong>{writtenCount}</strong>
-                      <p>
-                        {writtenCount
-                          ? compactText(memorySummary([...selectedRun.memory_context.written_project, ...selectedRun.memory_context.written_global]))
-                          : t("common.none")}
-                      </p>
+                      <p>{memoryOverviewCopy("written", writtenCount, locale, t("common.none"))}</p>
                     </article>
                     <article className="summary-card">
                       <span className="meta-label">{t("run.globalRules")}</span>
                       <strong>{promotedRuleCount}</strong>
-                      <p>{promotedRuleTitles.length ? compactText(promotedRuleTitles.join(" | ")) : t("run.globalRulesHint")}</p>
+                      <p>{memoryOverviewCopy("rules", promotedRuleCount, locale, t("run.globalRulesHint"))}</p>
                     </article>
                     <article className="summary-card">
                       <span className="meta-label">{t("run.trace")}</span>
@@ -494,32 +595,34 @@ export function RunStage({
                     <span>{stepProgress}</span>
                   </div>
                   <div className="step-list">
-                    {selectedRun.step_runs.map((stepRun) => (
-                      <article key={stepRun.step_id} className="step-item">
-                        <div className="step-header">
-                          <strong>{stepRun.title}</strong>
-                          <span className={`step-mode ${stepRun.status}`}>{statusLabel(stepRun.status)}</span>
-                        </div>
-                        <p>{stepRun.goal}</p>
-                        <div className="step-meta">
-                          <span>{agentRoleLabel(stepRun.agent_role)}</span>
-                          <span>{backendLabel(stepRun.backend)}</span>
-                          <span>{stepRun.depends_on.length ? t("common.after", { steps: stepRun.depends_on.join(", ") }) : t("common.entryStep")}</span>
-                          <span>{stepRun.summary ?? t("common.waiting")}</span>
-                        </div>
-                        {stepRun.command_previews.length ? (
-                          <div className="command-list compact-list">
-                            {stepRun.command_previews.map((preview) => (
-                              <article key={`${stepRun.step_id}-${preview.label}-${preview.argv.join(" ")}`} className="command-item">
-                                <strong>{preview.label}</strong>
-                                <code>{preview.argv.join(" ")}</code>
-                                {preview.cwd ? <span>{t("run.commandCwd")}: {preview.cwd}</span> : null}
-                              </article>
-                            ))}
+                    {selectedRun.step_runs.map((stepRun) => {
+                      const localizedStep = localizeStepCopy(stepRun.step_id, locale, stepRun.title, stepRun.goal);
+                      return (
+                        <article key={stepRun.step_id} className="step-item">
+                          <div className="step-header">
+                            <strong>{localizedStep.title}</strong>
+                            <span className={`step-mode ${stepRun.status}`}>{statusLabel(stepRun.status)}</span>
                           </div>
-                        ) : null}
-                      </article>
-                    ))}
+                          <p>{localizedStep.goal}</p>
+                          <div className="step-meta">
+                            <span>{agentRoleLabel(stepRun.agent_role)}</span>
+                            <span>{backendLabel(stepRun.backend)}</span>
+                            <span>{stepRun.depends_on.length ? t("common.after", { steps: stepRun.depends_on.join(", ") }) : t("common.entryStep")}</span>
+                          </div>
+                          {stepRun.command_previews.length ? (
+                            <div className="command-list compact-list">
+                              {stepRun.command_previews.map((preview) => (
+                                <article key={`${stepRun.step_id}-${preview.label}-${preview.argv.join(" ")}`} className="command-item">
+                                  <strong>{preview.label}</strong>
+                                  <code>{preview.argv.join(" ")}</code>
+                                  {preview.cwd ? <span>{t("run.commandCwd")}: {preview.cwd}</span> : null}
+                                </article>
+                              ))}
+                            </div>
+                          ) : null}
+                        </article>
+                      );
+                    })}
                   </div>
 
                   {selectedRun.requires_dangerous_command_confirmation || selectedRun.codex_commands.length || selectedRun.warnings.length ? (
@@ -663,7 +766,7 @@ export function RunStage({
                                 className={`artifact-nav-card ${selectedArtifact?.key === document.key ? "selected" : ""}`}
                                 onClick={() => onSelectArtifact(document.key)}
                               >
-                                <strong>{document.title}</strong>
+                                <strong>{localizedArtifactTitle(document.key, document.title, locale)}</strong>
                                 <span>{document.available ? t("common.ready") : t("common.waiting")}</span>
                               </button>
                             ))}
@@ -701,7 +804,7 @@ export function RunStage({
                       <div className="artifact-detail-shell">
                         <div className="artifact-detail-header">
                           <div>
-                            <span className="meta-label">{selectedArtifact.title}</span>
+                            <span className="meta-label">{localizedArtifactTitle(selectedArtifact.key, selectedArtifact.title, locale)}</span>
                             <strong>{selectedArtifact.available ? t("common.ready") : t("common.waiting")}</strong>
                           </div>
                           <div className="artifact-detail-meta">
@@ -774,8 +877,14 @@ export function RunStage({
                       chatMessages.map((message) => {
                         const expanded = isChatExpanded(message);
                         const processItems = buildChatProcessItems(message, t, backendLabel);
-                        const finalOutputDocument = buildChatFinalOutputDocument(message, artifactDocumentMap, t);
-                        const collapsedMessageCount = processItems.length + 1;
+                        const timeline = buildChatTimeline(message);
+                        const finalOutputDocument = buildChatFinalOutputDocument(message, artifactDocumentMap, t, timeline.finalMessage);
+                        const collapsedMessageCount = processItems.length + timeline.thinkingMessages.length + timeline.commands.length + 1;
+                        const localizedStep = localizeStepCopy(message.stepId, locale, message.title, message.goal);
+                        const collapsedPreview = formatCollapsedPreview(
+                          message.collapsedPreview ?? timeline.finalMessage ?? message.body,
+                          localizedStep.goal || t("run.chatPending"),
+                        );
                         return (
                           <article key={message.id} className={`chat-message chat-turn ${message.status} ${expanded ? "expanded" : "collapsed"}`}>
                             <div className="chat-rail">
@@ -784,55 +893,117 @@ export function RunStage({
                             <div className="chat-turn-main">
                               <div className="chat-bubble">
                                 <div className="chat-meta">
-                                  <strong>{agentRoleLabel(message.agentRole)}</strong>
+                                  <div className="chat-meta-leading">
+                                    <button
+                                      type="button"
+                                      className={`chat-toggle-button chat-toggle-button-inline ${expanded ? "expanded" : "collapsed"}`}
+                                      onClick={() => toggleChatMessage(message.id)}
+                                      aria-expanded={expanded}
+                                      aria-label={expanded ? t("run.chatCollapse") : t("run.chatExpand")}
+                                    >
+                                      <span className="chat-toggle-glyph" aria-hidden="true" />
+                                    </button>
+                                    <strong>{agentRoleLabel(message.agentRole)}</strong>
+                                  </div>
                                   <span>{message.timestamp ? formatDateTime(message.timestamp) : t("common.waiting")}</span>
                                 </div>
                                 <div className="chat-title-row">
-                                  <span className="chat-title">{message.title}</span>
+                                  <span className="chat-title">{localizedStep.title}</span>
                                   <span className={`step-mode ${message.status}`}>{statusLabel(message.status)}</span>
                                 </div>
-                                {expanded ? (
-                                  <div className="chat-preview-block">
-                                    <div className="chat-output-header">
-                                      <span className="meta-label">{t("run.chatFinalOutput")}</span>
-                                      <span>{finalOutputDocument.title}</span>
+                                <div className="chat-body-shell">
+                                  {expanded ? (
+                                    <div className="chat-expanded-shell">
+                                      <div className="chat-expanded-stack">
+                                        {timeline.thinkingMessages.length > 0 ? (
+                                          <details className="chat-thinking-shell" open={message.status === "running"}>
+                                            <summary className="chat-inline-summary">
+                                              <span>{message.status === "running" ? t("run.chatThinkingLive") : t("run.chatThinkingDone")}</span>
+                                              <span className="chat-inline-count">{t("run.chatThinkingSummary", { count: timeline.thinkingMessages.length })}</span>
+                                            </summary>
+                                            <div className="chat-thinking-list">
+                                              {timeline.thinkingMessages.map((thought, thoughtIndex) => (
+                                                <article key={`${message.id}-thought-${thoughtIndex}`} className="chat-thinking-item">
+                                                  <span className="meta-label">{t("run.chatThinkingLabel")}</span>
+                                                  <p>{thought}</p>
+                                                </article>
+                                              ))}
+                                            </div>
+                                          </details>
+                                        ) : null}
+                                        {timeline.commands.length > 0 ? (
+                                          <details className="chat-command-shell">
+                                            <summary className="chat-inline-summary">
+                                              <span>{t("run.chatCommandSummary", { count: timeline.commands.length })}</span>
+                                              <span className="chat-inline-count">{t("run.chatCommandCount", { count: timeline.commands.length })}</span>
+                                            </summary>
+                                            <div className="chat-command-list">
+                                              {timeline.commands.map((command) => (
+                                                <article key={`${message.id}-${command.id}-${command.sequence}`} className="chat-command-item">
+                                                  <div className="chat-command-meta">
+                                                    <strong>{command.label}</strong>
+                                                    <span className={`step-mode ${command.status === "failed" ? "failed" : command.status === "completed" ? "completed" : "running"}`}>
+                                                      {statusLabel(command.status === "cancelled" ? "cancelled" : command.status === "failed" ? "failed" : command.status === "running" ? "running" : "completed")}
+                                                    </span>
+                                                  </div>
+                                                  <code>{command.command}</code>
+                                                  {command.output ? (
+                                                    <details className="chat-command-output">
+                                                      <summary>{t("run.chatCommandOutput")}</summary>
+                                                      <pre className="log-viewer trace-raw-log">{command.output}</pre>
+                                                    </details>
+                                                  ) : null}
+                                                </article>
+                                              ))}
+                                            </div>
+                                          </details>
+                                        ) : null}
+                                        <div className="chat-preview-block">
+                                          <div className="chat-output-header">
+                                            <span className="meta-label">{t("run.chatFinalOutput")}</span>
+                                            <span>{localizedArtifactTitle(finalOutputDocument.key, finalOutputDocument.title, locale)}</span>
+                                          </div>
+                                          <div className="chat-output-viewer">
+                                            <ArtifactDocumentViewer document={finalOutputDocument} emptyLabel={t("run.chatPending")} />
+                                          </div>
+                                        </div>
+                                      </div>
                                     </div>
-                                    <div className="chat-output-viewer">
-                                      <ArtifactDocumentViewer document={finalOutputDocument} emptyLabel={t("run.chatPending")} />
+                                  ) : (
+                                    <div className="chat-collapsed-summary">
+                                      <div className="chat-collapsed-row">
+                                        <p className="chat-collapsed-preview">{collapsedPreview}</p>
+                                        <div className="chat-collapsed-meta">
+                                          <span className="chat-collapsed-chip">{statusLabel(message.status)}</span>
+                                          <span className="chat-collapsed-chip">{t("run.chatCollapsedCount", { count: collapsedMessageCount })}</span>
+                                          {timeline.thinkingMessages.length > 0 ? (
+                                            <span className="chat-collapsed-chip">{t("run.chatThinkingSummary", { count: timeline.thinkingMessages.length })}</span>
+                                          ) : null}
+                                          {timeline.commands.length > 0 ? (
+                                            <span className="chat-collapsed-chip">{t("run.chatCommandCount", { count: timeline.commands.length })}</span>
+                                          ) : null}
+                                        </div>
+                                      </div>
                                     </div>
-                                  </div>
-                                ) : (
-                                  <div className="chat-collapsed-summary">
-                                    <span className="meta-label">{t("run.chatCollapsedHeading")}</span>
-                                    <strong>{t("run.chatCollapsedCount", { count: collapsedMessageCount })}</strong>
-                                  </div>
-                                )}
+                                  )}
+                                </div>
                                 <div className="chat-submeta">
                                   <span>{backendLabel(message.backend)}</span>
                                   {message.provider ? <span>{message.provider}</span> : null}
-                                  <button
-                                    type="button"
-                                    className="chat-toggle-button"
-                                    onClick={() => toggleChatMessage(message.id)}
-                                  >
-                                    {expanded ? t("run.chatCollapse") : t("run.chatExpand")}
-                                  </button>
                                 </div>
                               </div>
                               {expanded ? (
-                                <div className="chat-expanded-stack">
-                                  <div className="chat-process-panel">
-                                    <div className="chat-process-section">
-                                      <span className="meta-label">{t("run.chatProcessHeading")}</span>
-                                      <div className="chat-process-list">
-                                        {processItems.map((item) => (
-                                          <article key={`${message.id}-${item.label}-${item.value}`} className="chat-process-item">
-                                            <span className="meta-label">{item.label}</span>
-                                            <strong>{item.value}</strong>
-                                            {item.meta ? <span>{item.meta}</span> : null}
-                                          </article>
-                                        ))}
-                                      </div>
+                                <div className="chat-process-panel open">
+                                  <div className="chat-process-section">
+                                    <span className="meta-label">{t("run.chatProcessHeading")}</span>
+                                    <div className="chat-process-list">
+                                      {processItems.map((item) => (
+                                        <article key={`${message.id}-${item.label}-${item.value}`} className="chat-process-item">
+                                          <span className="meta-label">{item.label}</span>
+                                          <strong>{item.value}</strong>
+                                          {item.meta ? <span>{item.meta}</span> : null}
+                                        </article>
+                                      ))}
                                     </div>
                                   </div>
                                 </div>
@@ -917,10 +1088,11 @@ function buildChatProcessItems(
 
   if (message.commandPreviews.length > 0) {
     for (const preview of message.commandPreviews) {
+      const metaParts = [preview.argv.join(" "), preview.cwd ? `${t("run.commandCwd")}: ${preview.cwd}` : ""].filter(Boolean);
       items.push({
         label: t("run.chatAction"),
         value: preview.label,
-        meta: [preview.argv.join(" "), preview.cwd ? `${t("run.commandCwd")}: ${preview.cwd}` : ""].filter(Boolean).join(" · "),
+        meta: metaParts.join(" | "),
       });
     }
   } else {
@@ -947,10 +1119,92 @@ function buildChatProcessItems(
   return items;
 }
 
+function buildChatTimeline(message: ChatMessage): ChatTimeline {
+  if (message.hasStructuredTimeline) {
+    return {
+      hasStructuredEvents: true,
+      thinkingMessages: message.thinkingMessages,
+      finalMessage: message.finalMessage,
+      commands: message.commandEvents,
+    };
+  }
+
+  if (message.events.length === 0) {
+    return {
+      hasStructuredEvents: false,
+      thinkingMessages: [],
+      finalMessage: message.body || null,
+      commands: [],
+    };
+  }
+
+  const agentMessages: string[] = [];
+  const commandMap = new Map<string, ChatCommandEvent>();
+
+  for (const event of message.events) {
+    if (event.event_type === "agent_message") {
+      const text = typeof event.payload.text === "string" ? event.payload.text.trim() : "";
+      if (text) {
+        agentMessages.push(text);
+      }
+      continue;
+    }
+
+    if (event.event_type === "command_execution") {
+      const commandId = typeof event.payload.command_id === "string" && event.payload.command_id ? event.payload.command_id : event.id;
+      const existing = commandMap.get(commandId);
+      commandMap.set(commandId, {
+        id: commandId,
+        label:
+          typeof event.payload.label === "string" && event.payload.label
+            ? event.payload.label
+            : typeof event.payload.command === "string" && event.payload.command
+            ? event.payload.command
+            : "Shell command",
+        command: typeof event.payload.command === "string" ? event.payload.command : existing?.command ?? "",
+        status: normalizeCommandStatus(event.payload.status),
+        output:
+          typeof event.payload.output === "string" && event.payload.output
+            ? event.payload.output
+            : existing?.output ?? "",
+        exitCode: typeof event.payload.exit_code === "number" ? event.payload.exit_code : existing?.exitCode ?? null,
+        sequence: event.sequence,
+      });
+    }
+  }
+
+  const commands = Array.from(commandMap.values()).sort((left, right) => left.sequence - right.sequence);
+  if (agentMessages.length === 0) {
+    return {
+      hasStructuredEvents: true,
+      thinkingMessages: [],
+      finalMessage: message.body || null,
+      commands,
+    };
+  }
+
+  if (message.status === "running") {
+    return {
+      hasStructuredEvents: true,
+      thinkingMessages: agentMessages,
+      finalMessage: null,
+      commands,
+    };
+  }
+
+  return {
+    hasStructuredEvents: true,
+    thinkingMessages: agentMessages.slice(0, -1),
+    finalMessage: agentMessages[agentMessages.length - 1] ?? message.body ?? null,
+    commands,
+  };
+}
+
 function buildChatFinalOutputDocument(
   message: ChatMessage,
   documents: Map<WorkflowArtifactDocument["key"], WorkflowArtifactDocument>,
   t: Translator,
+  structuredFinalMessage: string | null,
 ): WorkflowArtifactDocument {
   const preferredKeysByRole: Record<string, WorkflowArtifactDocument["key"][]> = {
     planner: ["planning_brief"],
@@ -969,6 +1223,17 @@ function buildChatFinalOutputDocument(
     }
   }
 
+  if (structuredFinalMessage) {
+    return {
+      key: "last_message",
+      title: t("run.chatInlineReply"),
+      path: null,
+      content_type: "text",
+      available: true,
+      content: structuredFinalMessage,
+    };
+  }
+
   return {
     key: "last_message",
     title: t("run.chatInlineReply"),
@@ -978,3 +1243,98 @@ function buildChatFinalOutputDocument(
     content: message.body,
   };
 }
+
+function normalizeCommandStatus(value: unknown): string {
+  if (typeof value !== "string" || !value) {
+    return "completed";
+  }
+  if (value === "in_progress") {
+    return "running";
+  }
+  return value;
+}
+
+function localizeStepCopy(stepId: string, locale: Locale, fallbackTitle: string, fallbackGoal: string | null): { title: string; goal: string } {
+  const localized = STEP_COPY[stepId];
+  const variant = locale === "zh-CN" ? localized?.zh : localized?.en;
+  return {
+    title: variant?.title ?? fallbackTitle,
+    goal: variant?.goal ?? fallbackGoal ?? "",
+  };
+}
+
+function localizedArtifactTitle(key: WorkflowArtifactDocument["key"], fallbackTitle: string, locale: Locale): string {
+  const localized = ARTIFACT_TITLES[key];
+  if (!localized) {
+    return fallbackTitle;
+  }
+  return locale === "zh-CN" ? localized.zh : localized.en;
+}
+
+function memoryOverviewCopy(kind: "recalled" | "written" | "rules", count: number, locale: Locale, emptyLabel: string): string {
+  if (count <= 0) {
+    return emptyLabel;
+  }
+  if (locale === "zh-CN") {
+    if (kind === "recalled") {
+      return "这次运行带上了已有的项目或全局记忆。";
+    }
+    if (kind === "written") {
+      return "这次运行写回了新的项目或全局记忆。";
+    }
+    return "这次运行沉淀了可复用的全局规则。";
+  }
+  if (kind === "recalled") {
+    return "This run started with recalled project or global memory.";
+  }
+  if (kind === "written") {
+    return "This run wrote new project or global memory back to the workspace.";
+  }
+  return "This run promoted reusable global rules.";
+}
+
+const STEP_COPY: Record<string, { zh: { title: string; goal: string }; en: { title: string; goal: string } }> = {
+  plan: {
+    zh: { title: "规划这次执行", goal: "把需求拆成清晰步骤、审批点和产物预期。" },
+    en: { title: "Plan the run", goal: "Break the request into clear stages, approvals, and expected artifacts." },
+  },
+  research: {
+    zh: { title: "检查代码和上下文", goal: "先补齐必要上下文，再进入实现，避免盲改。" },
+    en: { title: "Inspect code and context", goal: "Collect enough context before implementation so the edits stay grounded." },
+  },
+  implement: {
+    zh: { title: "直接修改文件", goal: "直接在目标项目里完成需要的改动。" },
+    en: { title: "Edit files directly", goal: "Make the requested changes in the target project." },
+  },
+  verify: {
+    zh: { title: "运行检查与实验", goal: "运行最相关的测试、脚本或命令检查，确认结果可用。" },
+    en: { title: "Run checks and experiments", goal: "Run the most relevant tests, scripts, or checks for the task." },
+  },
+  verify_tests: {
+    zh: { title: "运行回归测试", goal: "验证这次改动没有破坏已有行为。" },
+    en: { title: "Run regression tests", goal: "Verify that the change does not break existing behavior." },
+  },
+  verify_build: {
+    zh: { title: "运行构建与补充检查", goal: "补足构建、矩阵或补充校验，确认结果更稳。" },
+    en: { title: "Run build and matrix checks", goal: "Run build or supplemental matrix checks when they help confirm the result." },
+  },
+  review: {
+    zh: { title: "审查结果", goal: "检查质量、回归风险和遗漏的边界情况。" },
+    en: { title: "Review the result", goal: "Inspect quality, regression risk, and missing edge cases before handoff." },
+  },
+  report: {
+    zh: { title: "生成交接报告", goal: "整理改动、结果、后续事项和复现命令，但不自动提交 Git。" },
+    en: { title: "Produce handoff report", goal: "Summarize changes, outcomes, follow-ups, and reproduction commands without auto-committing Git." },
+  },
+};
+
+const ARTIFACT_TITLES: Partial<Record<WorkflowArtifactDocument["key"], { zh: string; en: string }>> = {
+  planning_brief: { zh: "规划简报", en: "Planning brief" },
+  report: { zh: "最终交接", en: "Final report" },
+  changes: { zh: "变更摘要", en: "Change summary" },
+  last_message: { zh: "最后回复", en: "Final message" },
+  project_snapshot: { zh: "项目快照", en: "Project snapshot" },
+  verification_brief: { zh: "验证简报", en: "Verification brief" },
+  parallel_branches: { zh: "并行分支", en: "Parallel branches" },
+  memory_context: { zh: "运行记忆", en: "Workflow memory" },
+};

@@ -399,6 +399,21 @@ def cancel_active_workflow_queue_items(run_id: str, settings: Settings, *, reaso
         connection.close()
 
 
+def delete_workflow_queue_items(run_id: str, settings: Settings) -> None:
+    initialize_control_db(settings)
+    connection = connect_control_db(settings)
+    try:
+        connection.execute(
+            """
+            DELETE FROM workflow_run_queue
+            WHERE run_id = ?
+            """,
+            (run_id,),
+        )
+    finally:
+        connection.close()
+
+
 def requeue_interrupted_workflow_queue_items(settings: Settings) -> int:
     initialize_control_db(settings)
     connection = connect_control_db(settings)

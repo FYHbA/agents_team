@@ -9,6 +9,7 @@ from app.models.dto import (
     WorkflowAgentSessionRecord,
     WorkflowQueueDashboardResponse,
     WorkflowRunArtifactsResponse,
+    WorkflowRunDeleteResponse,
     WorkflowPlanRequest,
     WorkflowPlanResponse,
     WorkflowRunCreateRequest,
@@ -20,6 +21,7 @@ from app.services.workflow_runs import (
     approve_workflow_run_dangerous_commands,
     cancel_workflow_run,
     create_workflow_run,
+    delete_workflow_run,
     get_workflow_queue_dashboard,
     list_agent_sessions,
     get_workflow_run,
@@ -66,6 +68,15 @@ def read_run(
     settings: Settings = Depends(get_settings),
 ) -> WorkflowRunRecord:
     return get_workflow_run(run_id, project_path, settings)
+
+
+@router.delete("/runs/{run_id}", response_model=WorkflowRunDeleteResponse)
+def remove_run(
+    run_id: str,
+    project_path: str | None = Query(default=None, description="Optional project path for a targeted lookup."),
+    settings: Settings = Depends(get_settings),
+) -> WorkflowRunDeleteResponse:
+    return delete_workflow_run(run_id, project_path, settings)
 
 
 @router.post("/runs/{run_id}/execute", response_model=WorkflowRunRecord)

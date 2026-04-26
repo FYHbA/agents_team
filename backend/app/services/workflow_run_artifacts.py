@@ -318,6 +318,7 @@ def _artifact_text(path: Path | None) -> tuple[bool, str]:
 
 
 def _artifact_documents(record: WorkflowRunRecord) -> list[WorkflowArtifactDocument]:
+    Path(record.run_path).mkdir(parents=True, exist_ok=True)
     snapshot_path = project_snapshot_path(record)
     branch_summary_path = parallel_branches_path(record)
     memory_context_path = Path(record.run_path) / "memory-context.md"

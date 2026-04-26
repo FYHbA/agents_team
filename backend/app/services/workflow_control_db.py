@@ -161,6 +161,32 @@ def _create_schema(connection: sqlite3.Connection) -> None:
         ON workflow_agent_sessions (run_id, started_at ASC)
         """
     )
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS workflow_agent_session_events (
+            id TEXT PRIMARY KEY,
+            session_id TEXT NOT NULL,
+            run_id TEXT NOT NULL,
+            step_id TEXT NOT NULL,
+            sequence INTEGER NOT NULL,
+            created_at TEXT NOT NULL,
+            event_type TEXT NOT NULL,
+            payload TEXT NOT NULL
+        )
+        """
+    )
+    connection.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_workflow_agent_session_events_session_sequence
+        ON workflow_agent_session_events (session_id, sequence ASC)
+        """
+    )
+    connection.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_workflow_agent_session_events_run_sequence
+        ON workflow_agent_session_events (run_id, sequence ASC)
+        """
+    )
 
 
 def _ensure_column(connection: sqlite3.Connection, table_name: str, column_name: str, column_spec: str) -> None:

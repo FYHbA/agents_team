@@ -14,6 +14,7 @@ import type {
   WorkflowRunArtifacts,
   WorkflowAgentSession,
   WorkflowRunEvent,
+  WorkflowRunDeleteResult,
   WorkflowRunLog,
   WorkflowRun,
 } from "./types";
@@ -155,6 +156,20 @@ export function getWorkflowRun(runId: string, projectPath?: string): Promise<Wor
   }
   return fetchJson<WorkflowRun>(
     `/api/workflows/runs/${encodeURIComponent(runId)}?project_path=${encodeURIComponent(projectPath)}`,
+  );
+}
+
+export function deleteWorkflowRun(runId: string, projectPath?: string): Promise<WorkflowRunDeleteResult> {
+  if (!projectPath) {
+    return fetchJson<WorkflowRunDeleteResult>(`/api/workflows/runs/${encodeURIComponent(runId)}`, {
+      method: "DELETE",
+    });
+  }
+  return fetchJson<WorkflowRunDeleteResult>(
+    `/api/workflows/runs/${encodeURIComponent(runId)}?project_path=${encodeURIComponent(projectPath)}`,
+    {
+      method: "DELETE",
+    },
   );
 }
 

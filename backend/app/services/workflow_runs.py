@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import shutil
 from pathlib import Path
+
+from fastapi import HTTPException
 
 from app.config import Settings
 from app.models.dto import (
@@ -11,14 +14,15 @@ from app.models.dto import (
     WorkflowStep,
     WorkflowRunArtifactsResponse,
     WorkflowRunCreateRequest,
+    WorkflowRunDeleteResponse,
     WorkflowRunLogResponse,
     WorkflowRunRecord,
 )
 from app.services.codex import build_session_bridge
 from app.services.runtime import init_project_runtime, project_runtime_path, resolve_project_path
-from app.services.workflow_agent_sessions import list_agent_sessions
+from app.services.workflow_agent_sessions import delete_agent_sessions, list_agent_sessions
 from app.services.workflow_memory import build_memory_context
-from app.services.workflow_run_queue import get_workflow_queue_dashboard
+from app.services.workflow_run_queue import delete_workflow_queue_items, get_workflow_queue_dashboard, has_active_workflow_queue_item
 from app.services.workflow_run_artifacts import changes_template, read_run_artifacts, report_template
 from app.services.workflow_run_execution import (
     approve_workflow_run_dangerous_commands,
@@ -31,6 +35,7 @@ from app.services.workflow_run_execution import (
     start_workflow_run,
 )
 from app.services.workflow_run_store import (
+    delete_workflow_run_record,
     get_workflow_run,
     initialize_step_runs,
     list_workflow_runs,
@@ -40,6 +45,40 @@ from app.services.workflow_run_store import (
     save_record,
 )
 from app.services.workflows import build_workflow_plan
+
+
+def _resolved_path(value: str | None) -> Path | None:
+    if not value:
+        return None
+    try:
+        return Path(value).expanduser().resolve()
+    except OSError:
+        return None
+
+
+def _path_within_root(candidate: Path, root: Path) -> bool:
+    try:
+        candidate.relative_to(root)
+        return True
+    except ValueError:
+        return False
+
+
+def _cleanup_deleted_run_files(record: WorkflowRunRecord) -> None:
+    runtime_root = _resolved_path(record.runtime_path)
+    if runtime_root is None:
+        return
+
+    runs_root = runtime_root / "runs"
+    run_root = _resolved_path(record.run_path)
+    if run_root and run_root.exists() and run_root != runs_root and _path_within_root(run_root, runs_root):
+        shutil.rmtree(run_root)
+
+    for file_path in {record.report_path, record.changes_path, record.log_path, record.last_message_path}:
+        candidate = _resolved_path(file_path)
+        if candidate is None or candidate.is_dir() or not _path_within_root(candidate, runtime_root):
+            continue
+        candidate.unlink(missing_ok=True)
 
 
 def _bridge_command_previews(
@@ -199,10 +238,32 @@ def read_workflow_run_artifacts(run_id: str, project_path_str: str | None, setti
     return read_run_artifacts(record)
 
 
+def delete_workflow_run(run_id: str, project_path_str: str | None, settings: Settings) -> WorkflowRunDeleteResponse:
+    record = get_workflow_run(run_id, project_path_str, settings)
+    if record.status == "running":
+        raise HTTPException(status_code=409, detail="Cannot delete a running run. Cancel it first and wait for it to stop.")
+    if has_active_workflow_queue_item(record.id, settings):
+        raise HTTPException(
+            status_code=409,
+            detail="Cannot delete a queued or running run. Cancel it first and wait for queue activity to finish.",
+        )
+
+    _cleanup_deleted_run_files(record)
+    delete_agent_sessions(record.id, settings)
+    delete_workflow_queue_items(record.id, settings)
+    delete_workflow_run_record(record.id, settings)
+    return WorkflowRunDeleteResponse(
+        run_id=record.id,
+        project_path=record.project_path,
+        deleted_at=now_iso(),
+    )
+
+
 __all__ = [
     "approve_workflow_run_dangerous_commands",
     "cancel_workflow_run",
     "create_workflow_run",
+    "delete_workflow_run",
     "execute_workflow_run_now",
     "get_workflow_run",
     "get_workflow_queue_dashboard",

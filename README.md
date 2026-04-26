@@ -90,6 +90,7 @@ powershell -ExecutionPolicy Bypass -File scripts/dev-down.ps1
 - `POST /api/workflows/runs`
 - `GET /api/workflows/runs?project_path=<project-dir>`
 - `GET /api/workflows/runs/{run_id}`
+- `DELETE /api/workflows/runs/{run_id}`
 - `POST /api/workflows/runs/{run_id}/execute`
 - `GET /api/workflows/runs/{run_id}/log`
 - `GET /api/workflows/runs/{run_id}/artifacts`
@@ -135,10 +136,14 @@ Project opening and switching are now more browser-friendly: the UI can read rec
 Once a project is open, task drafting, runtime tools, run orchestration, artifacts, quick project switching, and secondary diagnostics stay in one continuous workbench instead of separate top-level pages.
 The workbench now separates its two primary jobs into dedicated full-width sections: one area for building the team and shaping the next run, and one area for the run cockpit itself. This makes it easier to focus on composition first and execution second.
 The run cockpit also now includes a chat-style agent session view, so step-scoped agent updates can be read more like a conversation timeline instead of a raw metadata list.
+Agent sessions now also persist structured per-session event timelines, so the chat room can distinguish between in-progress thinking text, shell-command activity, and the final answer instead of flattening everything into one summary blob.
+That agent-session API now also exposes explicit presentation fields for `thinking`, `final`, `collapsed preview`, and normalized command entries, so old summary-only runs and newer structured-event runs collapse consistently instead of relying on frontend inference.
 The build surface now offers short task-drafting guidance when the request is still too thin, which helps first-time users shape a runnable brief without leaving the main composition flow.
 The run ledger now has lightweight search, deferred filtering, and date-grouped sections, so browsing older runs stays workable once a project starts accumulating real history.
+Inactive run ledger entries can now also be deleted end-to-end, which removes the stored run record, queue history, agent sessions, and saved artifacts together instead of leaving stale cockpit entries behind.
 Artifact reading is also more document-friendly now: markdown artifacts render with headings, lists, quotes, and code blocks instead of only as one raw preformatted text block, and the reader now includes a cross-document navigator, previous/next actions, a heading outline for the current document, and clearer path/type labeling.
 Run detail summary cards now live inside the overview tab instead of staying pinned above every detail view, and the chat room behaves more like a process transcript: active turns stay expanded, completed turns collapse into a compact message count, users can reopen any turn, expanded turns show the full final output plus process details, and the thread scrolls inside its own frame instead of taking over the whole page.
+When a session includes structured events, the chat room now follows a more Codex-like turn model: thinking notes stay open while the run is active, shell commands stay collapsed unless the user expands them, and once the step finishes the thinking collapses behind a disclosure while the final answer stays visible. The disclosure control itself now reads more like Codex too, with a tighter circular toggle and a softer expand/collapse transition instead of a generic pill button.
 When a chat turn is expanded, the UI now tries to show stage-specific result cards instead of only a long prose blob: files touched, checks run, warnings, suggested follow-ups, and other high-signal outcomes are pulled from the run's artifacts when that data exists.
 The trace tab no longer dumps every giant stdout/stderr block inline by default either. It now summarizes oversized stream output into compact cards with event counts, command counts, agent updates, and hidden-output totals, while still letting you open the raw block when you need the full log.
 Secondary surfaces now use less implementation-heavy language as well, especially around queued work, artifact types, and step-stage labels.

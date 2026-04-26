@@ -12,18 +12,20 @@ from fastapi import HTTPException
 from app.models.dto import CodexCommandSpec, CodexSessionBridgeResponse, CodexSessionSummary, MemoryEntry, WorkflowRunCreateRequest
 from app.services import workflow_run_execution as execution_service
 from app.services import workflow_backend_codex_delegate as delegate_service
+from app.services.workflow_agent_sessions import append_agent_session_event, finish_agent_session, start_agent_session
 from app.services.workflow_backend_planner import execute_planner_backend, planning_brief_path
 from app.services.workflow_control_db import connect_control_db
 from app.services.workflow_backend_research import execute_research_backend, project_snapshot_path
 from app.services.workflow_backend_verify import execute_verify_backend, verification_brief_path
 from app.services.workflow_memory import global_memory_path, project_memory_path
-from app.services.workflow_run_queue import enqueue_workflow_run, read_workflow_queue, workflow_queue_path
+from app.services.workflow_run_queue import complete_workflow_queue_item, enqueue_workflow_run, read_workflow_queue, workflow_queue_path
 from app.services.workflow_run_steps import WorkflowCancellationRequested
 from app.services.workflow_run_store import now_iso, run_store_path, save_record
 from app.services.workflow_runs import (
     approve_workflow_run_dangerous_commands,
     cancel_workflow_run,
     create_workflow_run,
+    delete_workflow_run,
     execute_workflow_run_now,
     get_workflow_queue_dashboard,
     get_workflow_run,
@@ -253,6 +255,99 @@ def test_start_immediately_keeps_run_planned_until_dangerous_commands_are_approv
     assert any("explicit approval" in warning.lower() for warning in record.warnings)
 
 
+def test_workflow_run_delete_removes_records_and_artifacts(test_settings, tmp_path: Path) -> None:
+    project_path = tmp_path / "repo"
+    project_path.mkdir()
+
+    record = create_workflow_run(
+        WorkflowRunCreateRequest(
+            task="Delete a completed run and all of its stored UI state.",
+            project_path=str(project_path),
+        ),
+        test_settings,
+    )
+
+    Path(record.last_message_path).write_text("Final message for deletion coverage.\n", encoding="utf-8")
+    queue_item = enqueue_workflow_run(
+        run_id=record.id,
+        project_path=str(project_path),
+        mode="start",
+        prepared=True,
+        settings=test_settings,
+    )
+    complete_workflow_queue_item(item_id=queue_item["id"], status="completed", settings=test_settings)
+
+    step_run = next(step for step in record.step_runs if step.step_id == "implement")
+    session = start_agent_session(
+        record=record,
+        step_run=step_run,
+        settings=test_settings,
+        worker_id="worker-delete",
+    )
+    append_agent_session_event(
+        settings=test_settings,
+        event_type="agent_message",
+        payload={"text": "Preparing this run for deletion."},
+    )
+    finish_agent_session(
+        session_id=session.id,
+        settings=test_settings,
+        status="completed",
+        summary="Deletion coverage session completed.",
+    )
+
+    deleted = delete_workflow_run(record.id, str(project_path), test_settings)
+    assert deleted.run_id == record.id
+    assert deleted.project_path == str(project_path)
+
+    with pytest.raises(HTTPException, match=f"Run not found: {record.id}"):
+        get_workflow_run(record.id, str(project_path), test_settings)
+
+    assert not Path(record.run_path).exists()
+    assert not Path(record.report_path).exists()
+
+    connection = connect_control_db(test_settings)
+    try:
+        run_count = connection.execute("SELECT COUNT(*) FROM workflow_runs WHERE id = ?", (record.id,)).fetchone()[0]
+        queue_count = connection.execute("SELECT COUNT(*) FROM workflow_run_queue WHERE run_id = ?", (record.id,)).fetchone()[0]
+        session_count = connection.execute("SELECT COUNT(*) FROM workflow_agent_sessions WHERE run_id = ?", (record.id,)).fetchone()[0]
+        event_count = connection.execute(
+            "SELECT COUNT(*) FROM workflow_agent_session_events WHERE run_id = ?",
+            (record.id,),
+        ).fetchone()[0]
+    finally:
+        connection.close()
+
+    assert run_count == 0
+    assert queue_count == 0
+    assert session_count == 0
+    assert event_count == 0
+
+
+def test_workflow_run_delete_rejects_active_queue_items(test_settings, tmp_path: Path) -> None:
+    project_path = tmp_path / "repo"
+    project_path.mkdir()
+
+    record = create_workflow_run(
+        WorkflowRunCreateRequest(
+            task="Try to delete a queued workflow run before it is safe.",
+            project_path=str(project_path),
+        ),
+        test_settings,
+    )
+
+    enqueue_workflow_run(
+        run_id=record.id,
+        project_path=str(project_path),
+        mode="start",
+        prepared=True,
+        settings=test_settings,
+    )
+
+    with pytest.raises(HTTPException, match="Cannot delete a queued or running run"):
+        delete_workflow_run(record.id, str(project_path), test_settings)
+
+
 def test_background_start_persists_and_completes_queue_item(monkeypatch, test_settings, tmp_path: Path) -> None:
     project_path = tmp_path / "repo"
     project_path.mkdir()
@@ -464,6 +559,73 @@ def test_workflow_run_executes_to_completion(monkeypatch, test_settings, tmp_pat
     agent_sessions = list_agent_sessions(executed.id, test_settings)
     assert agent_sessions
     assert any(session.step_id == "implement" and session.status == "completed" for session in agent_sessions)
+
+
+def test_agent_sessions_can_return_structured_chat_events(test_settings, tmp_path: Path) -> None:
+    project_path = tmp_path / "repo"
+    project_path.mkdir()
+
+    record = create_workflow_run(
+        WorkflowRunCreateRequest(
+            task="Implement structured chat events for a workflow run.",
+            project_path=str(project_path),
+        ),
+        test_settings,
+    )
+
+    step_run = next(step for step in record.step_runs if step.step_id == "implement")
+    session = start_agent_session(
+        record=record,
+        step_run=step_run,
+        settings=test_settings,
+        worker_id="worker-test",
+    )
+    append_agent_session_event(
+        settings=test_settings,
+        event_type="agent_message",
+        payload={"text": "I am inspecting the repo before editing."},
+    )
+    append_agent_session_event(
+        settings=test_settings,
+        event_type="command_execution",
+        payload={
+            "command_id": "cmd-1",
+            "label": "rg --files",
+            "command": "rg --files",
+            "status": "completed",
+            "output": "calculator.py",
+            "exit_code": 0,
+        },
+    )
+    append_agent_session_event(
+        settings=test_settings,
+        event_type="agent_message",
+        payload={"text": "Implemented the calculator and verified the entrypoint."},
+    )
+    finish_agent_session(
+        session_id=session.id,
+        settings=test_settings,
+        status="completed",
+        summary="Implemented the calculator and verified the entrypoint.",
+    )
+
+    sessions = list_agent_sessions(record.id, test_settings)
+    loaded = next(item for item in sessions if item.id == session.id)
+    assert loaded.status == "completed"
+    assert [event.event_type for event in loaded.events] == [
+        "agent_message",
+        "command_execution",
+        "agent_message",
+        "session_summary",
+    ]
+    assert loaded.has_structured_timeline is True
+    assert loaded.thinking_messages == ["I am inspecting the repo before editing."]
+    assert loaded.final_message == "Implemented the calculator and verified the entrypoint."
+    assert loaded.collapsed_preview == "Implemented the calculator and verified the entrypoint."
+    assert len(loaded.commands) == 1
+    assert loaded.commands[0].command == "rg --files"
+    assert loaded.events[0].payload["text"] == "I am inspecting the repo before editing."
+    assert loaded.events[1].payload["command"] == "rg --files"
 
 
 def test_failed_run_can_resume_without_repeating_completed_steps(monkeypatch, test_settings, tmp_path: Path) -> None:

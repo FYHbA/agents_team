@@ -45,6 +45,9 @@ export function BuildStage({
   embedded = false,
 }: BuildStageProps) {
   const shouldShowTaskChecklist = task.trim().length < 8;
+  const canDraft = task.trim().length >= 8;
+  const canRun = canDraft && Boolean(selectedProject);
+  const emphasizeRun = Boolean(plan);
   const checklistItems = [
     {
       label: t("build.checklistGoalLabel"),
@@ -78,7 +81,7 @@ export function BuildStage({
             <textarea
               value={task}
               onChange={(event) => onTaskChange(event.target.value)}
-              rows={10}
+              rows={8}
               placeholder={t("build.taskPlaceholder")}
             />
           </label>
@@ -98,12 +101,22 @@ export function BuildStage({
               ))}
             </div>
           ) : null}
-          <div className="button-row">
-            <button type="button" className="primary-button" onClick={onCreateRun} disabled={runLoading || task.trim().length < 8 || !selectedProject}>
-              {runLoading ? t("build.runLoading") : t("build.runButton")}
-            </button>
-            <button type="button" className="secondary-button" onClick={onDraftWorkflow} disabled={loading || task.trim().length < 8}>
+          <div className="button-row build-action-row">
+            <button
+              type="button"
+              className={emphasizeRun ? "secondary-button" : "primary-button"}
+              onClick={onDraftWorkflow}
+              disabled={loading || !canDraft}
+            >
               {loading ? t("build.planLoading") : t("build.planButton")}
+            </button>
+            <button
+              type="button"
+              className={emphasizeRun ? "primary-button" : "secondary-button"}
+              onClick={onCreateRun}
+              disabled={runLoading || !canRun}
+            >
+              {runLoading ? t("build.runLoading") : t("build.runButton")}
             </button>
           </div>
           <details className="advanced-section">

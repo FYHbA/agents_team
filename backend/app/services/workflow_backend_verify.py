@@ -62,6 +62,7 @@ def _local_verify(
     for label, argv in commands:
         completed = run_command(
             argv,
+            settings=settings,
             cwd=record.project_path,
             timeout=VERIFY_TIMEOUT_SECONDS,
             log_prefix=label,

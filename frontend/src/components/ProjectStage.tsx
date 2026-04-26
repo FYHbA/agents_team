@@ -129,7 +129,11 @@ export function ProjectStage({
             ) : (
               <span className="inline-note">{t("project.pickFolderUnavailableHint")}</span>
             )}
-            {selectedProject ? <span className="project-pill">{selectedProject}</span> : null}
+            {selectedProject ? (
+              <span className="project-pill" title={selectedProject}>
+                {compactPath(selectedProject)}
+              </span>
+            ) : null}
           </div>
           {runtimeError ? <div className="inline-error">{runtimeError}</div> : null}
         </article>
@@ -144,8 +148,7 @@ export function ProjectStage({
               {recentWithoutSelected.map((project) => (
                 <button key={project.path} type="button" className="project-card" onClick={() => onOpenProject(project.path, "filesystem")}>
                   <strong>{project.path}</strong>
-                  <span>{project.updated_at}</span>
-                  <span>{t("project.openRecent")}</span>
+                  <span className="recent-project-meta">{formatRecentProjectDate(project.updated_at)}</span>
                 </button>
               ))}
             </div>
@@ -206,7 +209,7 @@ export function ProjectStage({
               ))}
             </div>
             {browserError ? <div className="inline-error">{browserError}</div> : null}
-            <div className="project-card-list compact-list">
+            <div className="project-card-list compact-list launcher-browser-list">
               {filteredBrowserEntries.length === 0 ? (
                 <div className="empty-state">{browserLoading ? t("common.loading") : t("project.browserEmpty")}</div>
               ) : (
@@ -230,7 +233,7 @@ export function ProjectStage({
               <h3>{t("project.discovered")}</h3>
               <span>{discoveredProjects.length}</span>
             </div>
-            <div className="project-card-list compact-list">
+            <div className="project-card-list compact-list launcher-discovered-list">
               {discoveredProjects.length === 0 ? (
                 <div className="empty-state">{t("project.noneDiscovered")}</div>
               ) : (
@@ -280,4 +283,28 @@ function buildPathCrumbs(path: string): Array<{ label: string; path: string }> {
     crumbs.push({ label: part, path: current });
   }
   return crumbs;
+}
+
+function formatRecentProjectDate(value: string): string {
+  if (!value) {
+    return "";
+  }
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) {
+    return value;
+  }
+  return new Intl.DateTimeFormat(undefined, {
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+  }).format(date);
+}
+
+function compactPath(path: string, limit = 44): string {
+  if (path.length <= limit) {
+    return path;
+  }
+  const visible = Math.max(8, Math.floor((limit - 3) / 2));
+  return `${path.slice(0, visible)}...${path.slice(-visible)}`;
 }

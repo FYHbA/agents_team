@@ -241,13 +241,13 @@ def _execute_step_with_agent_session(
     should_cancel,
     set_active_process,
 ) -> str:
+    clear_agent_runtime_metadata()
     session = start_agent_session(
         record=record,
         step_run=step_run,
         settings=settings,
         worker_id=_current_execution_worker_id(),
     )
-    clear_agent_runtime_metadata()
     try:
         summary = execute_step(
             record,
@@ -274,13 +274,16 @@ def _execute_step_with_agent_session(
             error=str(exc),
         )
         raise
-    finish_agent_session(
-        session_id=session.id,
-        settings=settings,
-        status="completed",
-        summary=summary,
-    )
-    return summary
+    else:
+        finish_agent_session(
+            session_id=session.id,
+            settings=settings,
+            status="completed",
+            summary=summary,
+        )
+        return summary
+    finally:
+        clear_agent_runtime_metadata()
 
 
 def _prepare_for_resume(record: WorkflowRunRecord) -> None:

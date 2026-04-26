@@ -248,6 +248,12 @@ export type WorkflowRunLog = {
   content: string;
 };
 
+export type WorkflowRunDeleteResult = {
+  run_id: string;
+  project_path: string;
+  deleted_at: string;
+};
+
 export type WorkflowRunEvent = {
   run: WorkflowRun;
   log: WorkflowRunLog;
@@ -341,4 +347,39 @@ export type WorkflowAgentSession = {
   completed_at: string | null;
   summary: string | null;
   error: string | null;
+  has_structured_timeline: boolean;
+  thinking_messages: string[];
+  final_message: string | null;
+  collapsed_preview: string | null;
+  commands: WorkflowAgentCommand[];
+  events: WorkflowAgentSessionEvent[];
+};
+
+export type WorkflowAgentSessionEvent = {
+  id: string;
+  session_id: string;
+  run_id: string;
+  step_id: string;
+  sequence: number;
+  created_at: string;
+  event_type: string;
+  payload: Record<string, unknown>;
+};
+
+export type WorkflowAgentCommand = {
+  id: string;
+  label: string;
+  command: string;
+  status: string;
+  output: string;
+  exit_code: number | null;
+  sequence: number;
+};
+
+export type WorkflowAgentSessionPresentation = {
+  has_structured_timeline: boolean;
+  thinking_messages: string[];
+  final_message: string | null;
+  collapsed_preview: string | null;
+  commands: WorkflowAgentCommand[];
 };

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Literal
+from typing import Any, Literal
 
 from pydantic import BaseModel, Field
 
@@ -340,6 +340,12 @@ class WorkflowRunLogResponse(BaseModel):
     content: str
 
 
+class WorkflowRunDeleteResponse(BaseModel):
+    run_id: str
+    project_path: str
+    deleted_at: str
+
+
 class WorkflowArtifactDocument(BaseModel):
     key: Literal[
         "planning_brief",
@@ -406,6 +412,16 @@ class WorkflowQueueDashboardResponse(BaseModel):
     stale_worker_count: int = 0
 
 
+class WorkflowAgentCommandRecord(BaseModel):
+    id: str
+    label: str
+    command: str
+    status: str
+    output: str
+    exit_code: int | None = None
+    sequence: int
+
+
 class WorkflowAgentSessionRecord(BaseModel):
     id: str
     run_id: str
@@ -429,6 +445,24 @@ class WorkflowAgentSessionRecord(BaseModel):
     completed_at: str | None = None
     summary: str | None = None
     error: str | None = None
+    has_structured_timeline: bool = False
+    thinking_messages: list[str] = Field(default_factory=list)
+    final_message: str | None = None
+    collapsed_preview: str | None = None
+    commands: list[WorkflowAgentCommandRecord] = Field(default_factory=list)
+    events: list["WorkflowAgentSessionEventRecord"] = Field(default_factory=list)
+
+
+class WorkflowAgentSessionEventRecord(BaseModel):
+    id: str
+    session_id: str
+    run_id: str
+    step_id: str
+    sequence: int
+    created_at: str
+    event_type: str
+    payload: dict[str, Any] = Field(default_factory=dict)
 
 
 ProjectTreeEntry.model_rebuild()
+WorkflowAgentSessionRecord.model_rebuild()

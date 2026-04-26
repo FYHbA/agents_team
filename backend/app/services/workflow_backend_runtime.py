@@ -2,21 +2,115 @@ from __future__ import annotations
 
 import json
 import subprocess
+import threading
 import time
 from collections.abc import Callable
 from pathlib import Path
+from queue import Empty, Queue
+from uuid import uuid4
 
+from app.config import Settings
 from app.models.dto import WorkflowCommandPreview
 from app.models.dto import WorkflowRunRecord
+from app.services.workflow_agent_sessions import append_agent_session_event
 from app.services.workflow_backend_exceptions import WorkflowCancellationRequested, WorkflowExecutionError
 from app.services.workflow_run_store import append_log
 
 POLL_INTERVAL_SECONDS = 0.25
 
 
+def _looks_like_codex_exec(argv: list[str]) -> bool:
+    return len(argv) >= 2 and argv[0] == "codex" and argv[1] == "exec"
+
+
+def _enqueue_stream_lines(
+    stream,
+    source: str,
+    queue: Queue[tuple[str, str | None]],
+) -> None:
+    if stream is None:
+        queue.put((source, None))
+        return
+    try:
+        for line in iter(stream.readline, ""):
+            queue.put((source, line))
+    finally:
+        try:
+            stream.close()
+        except OSError:
+            pass
+        queue.put((source, None))
+
+
+def _record_plain_command_event(
+    *,
+    settings: Settings,
+    record: WorkflowRunRecord,
+    command_id: str,
+    label: str,
+    command: str,
+    status: str,
+    output: str = "",
+    exit_code: int | None = None,
+) -> None:
+    append_agent_session_event(
+        settings=settings,
+        event_type="command_execution",
+        payload={
+            "command_id": command_id,
+            "label": label,
+            "command": command,
+            "status": status,
+            "output": output,
+            "exit_code": exit_code,
+        },
+    )
+
+
+def _capture_codex_stream_event(settings: Settings, line: str) -> None:
+    try:
+        payload = json.loads(line)
+    except json.JSONDecodeError:
+        return
+    if not isinstance(payload, dict):
+        return
+
+    item = payload.get("item")
+    if not isinstance(item, dict):
+        return
+
+    item_type = item.get("type")
+    if item_type == "agent_message" and isinstance(item.get("text"), str):
+        append_agent_session_event(
+            settings=settings,
+            event_type="agent_message",
+            payload={
+                "item_id": str(item.get("id") or ""),
+                "status": str(item.get("status") or ""),
+                "text": item["text"],
+            },
+        )
+        return
+
+    if item_type == "command_execution" and isinstance(item.get("command"), str):
+        append_agent_session_event(
+            settings=settings,
+            event_type="command_execution",
+            payload={
+                "command_id": str(item.get("id") or ""),
+                "label": str(item.get("command") or ""),
+                "command": item["command"],
+                "status": str(item.get("status") or ""),
+                "output": str(item.get("aggregated_output") or ""),
+                "exit_code": item.get("exit_code"),
+            },
+        )
+
+
 def run_command(
     argv: list[str],
     *,
+    settings: Settings,
     cwd: str,
     timeout: int,
     log_prefix: str,
@@ -25,6 +119,18 @@ def run_command(
     set_active_process: Callable[[subprocess.Popen[str] | None], None],
 ) -> subprocess.CompletedProcess[str]:
     append_log(record, f"{log_prefix}: {' '.join(argv)}")
+    looks_like_codex_stream = _looks_like_codex_exec(argv)
+    plain_command_event_id = f"cmd-{uuid4().hex[:10]}"
+    plain_command = " ".join(argv)
+    if not looks_like_codex_stream:
+        _record_plain_command_event(
+            settings=settings,
+            record=record,
+            command_id=plain_command_event_id,
+            label=log_prefix,
+            command=plain_command,
+            status="running",
+        )
     try:
         process = subprocess.Popen(
             argv,
@@ -34,43 +140,99 @@ def run_command(
             text=True,
             encoding="utf-8",
             errors="replace",
+            bufsize=1,
         )
     except FileNotFoundError as exc:
         raise WorkflowExecutionError(f"Command not found: {argv[0]}") from exc
 
     set_active_process(process)
-    stdout = ""
-    stderr = ""
+    stdout_chunks: list[str] = []
+    stderr_chunks: list[str] = []
     deadline = time.monotonic() + timeout
+    queue: Queue[tuple[str, str | None]] = Queue()
+    stdout_thread = threading.Thread(
+        target=_enqueue_stream_lines,
+        args=(process.stdout, "stdout", queue),
+        daemon=True,
+        name=f"workflow-stdout-{plain_command_event_id}",
+    )
+    stderr_thread = threading.Thread(
+        target=_enqueue_stream_lines,
+        args=(process.stderr, "stderr", queue),
+        daemon=True,
+        name=f"workflow-stderr-{plain_command_event_id}",
+    )
+    stdout_thread.start()
+    stderr_thread.start()
+    stdout_closed = False
+    stderr_closed = False
+    cancelled = False
+    timed_out = False
+    cancellation_message = f"Workflow execution was cancelled while running `{log_prefix}`."
 
     try:
         while True:
+            if process.poll() is not None and stdout_closed and stderr_closed:
+                break
+
             if should_cancel():
                 process.terminate()
-                try:
-                    stdout, stderr = process.communicate(timeout=5)
-                except subprocess.TimeoutExpired:
-                    process.kill()
-                    stdout, stderr = process.communicate()
-                raise WorkflowCancellationRequested(f"Workflow execution was cancelled while running `{log_prefix}`.")
+                cancelled = True
 
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 process.kill()
-                stdout, stderr = process.communicate()
-                raise WorkflowExecutionError(f"Command timed out after {timeout} seconds: {log_prefix}")
+                timed_out = True
 
             try:
-                stdout, stderr = process.communicate(timeout=min(POLL_INTERVAL_SECONDS, remaining))
-                break
-            except subprocess.TimeoutExpired:
+                source, line = queue.get(timeout=POLL_INTERVAL_SECONDS)
+            except Empty:
                 continue
+            if line is None:
+                if source == "stdout":
+                    stdout_closed = True
+                else:
+                    stderr_closed = True
+                continue
+            if source == "stdout":
+                stdout_chunks.append(line)
+                if looks_like_codex_stream:
+                    _capture_codex_stream_event(settings, line)
+            else:
+                stderr_chunks.append(line)
     finally:
+        if process.poll() is None:
+            process.wait(timeout=5)
+        stdout_thread.join(timeout=1)
+        stderr_thread.join(timeout=1)
         set_active_process(None)
+        stdout = "".join(stdout_chunks)
+        stderr = "".join(stderr_chunks)
         if stdout.strip():
             append_log(record, f"{log_prefix} stdout:\n{stdout.rstrip()}")
         if stderr.strip():
             append_log(record, f"{log_prefix} stderr:\n{stderr.rstrip()}")
+        if not looks_like_codex_stream:
+            final_output = stdout.strip()
+            if stderr.strip():
+                final_output = f"{final_output}\n{stderr.strip()}".strip()
+            _record_plain_command_event(
+                settings=settings,
+                record=record,
+                command_id=plain_command_event_id,
+                label=log_prefix,
+                command=plain_command,
+                status="cancelled" if cancelled else ("failed" if (timed_out or process.returncode != 0) else "completed"),
+                output=final_output,
+                exit_code=process.returncode,
+            )
+
+    stdout = "".join(stdout_chunks)
+    stderr = "".join(stderr_chunks)
+    if cancelled:
+        raise WorkflowCancellationRequested(cancellation_message)
+    if timed_out:
+        raise WorkflowExecutionError(f"Command timed out after {timeout} seconds: {log_prefix}")
 
     return subprocess.CompletedProcess(argv, process.returncode, stdout, stderr)
 
